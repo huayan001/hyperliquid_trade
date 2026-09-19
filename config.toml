@@ -1,0 +1,74 @@
+# Hyperliquid 永续合约机器人 — 默认配置（v1.1）
+# 环境变量可覆盖同名项。密钥只能走环境变量，不要写进本文件。
+
+symbols = ["BTC", "ETH", "SOL", "HYPE"]
+network = "mainnet"          # mainnet | testnet
+dry_run = true
+paper_equity = 10000.0
+poll_seconds = 60
+state_path = "state/paper_state.json"
+
+[regime]
+# 日线 ADX 超过该值才视为「趋势明确」（文档 20~25 的中间偏明确一侧）
+clear_trend_adx = 22.5
+# 日线 ADX 低于该值不算趋势，避免 20 附近中间地带误开趋势仓
+trend_adx_min = 20.0
+# 1h ADX 低于该值才考虑均值回归
+mr_adx_max = 20.0
+# 区间结构回看小时数（文档 8–12）
+range_lookback_hours = 12
+range_touch_frac = 0.20
+
+[trend]
+ema_fast = 20
+ema_slow = 50
+adx_period = 14
+adx_exit = 15.0
+btc_short_adx_min = 25.0
+donchian_period = 20
+atr_period = 14
+stop_atr = 2.0
+trail_step_atr = 1.0
+trail_offset_atr = 0.5
+chase_body_atr = 1.5
+chase_symbols = ["BTC"]
+risk_pct = 0.015             # 1.5%，文档 1%–2%
+btc_short_risk_mult = 0.7
+max_positions = 3
+portfolio_risk_max = 0.06
+daily_loss_delever = 0.05
+weekly_loss_delever = 0.10
+funding_annual_warn = 0.50
+# 高资金费时仓位下调系数（不做马丁，只缩小）
+funding_size_mult = 0.5
+
+[mean_reversion]
+bb_period = 20
+bb_std = 2.0
+rsi_period = 14
+rsi_oversold = 30.0
+rsi_overbought = 70.0
+adx_period = 14
+adx_max = 20.0
+adx_kill = 25.0
+atr_period = 14
+stop_atr = 1.0
+time_stop_hours = 5.0        # 文档 4–6 小时
+partial_tp_frac = 0.5
+risk_pct = 0.0075            # 0.75%，文档 0.5%–1%
+max_positions = 2
+max_trades_per_symbol_day = 4
+daily_loss_halt = 0.03
+leverage_cap = 5
+chase_body_atr = 1.5
+bandwidth_high_rank = 0.80   # 近 20 期高位区
+
+[risk]
+isolated = true
+min_notional_usd = 10.0
+
+[risk.max_leverage]
+BTC = 40
+ETH = 25
+SOL = 20
+HYPE = 10
