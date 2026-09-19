@@ -75,8 +75,8 @@ def downtrend(n: int, start_px: float = 200.0, step: float = 1.5, interval: int 
     return series_from_closes(closes, interval=interval, wick=0.002)
 
 
-def dummy_range(is_range: bool = False) -> RangeStructure:
-    return RangeStructure(is_range, 110.0, 100.0, is_range, is_range, False, "fixture")
+def dummy_range(is_range: bool = False, high: float = 110.0, low: float = 100.0) -> RangeStructure:
+    return RangeStructure(is_range, high, low, is_range, is_range, False, "fixture")
 
 
 def decision(
@@ -87,6 +87,8 @@ def decision(
     daily_adx: float = 30.0,
     hourly_adx: float = 28.0,
     is_range: bool = False,
+    range_high: float = 110.0,
+    range_low: float = 100.0,
 ) -> RegimeDecision:
     return RegimeDecision(
         regime,
@@ -94,7 +96,7 @@ def decision(
         ema_slow,
         daily_adx,
         hourly_adx,
-        dummy_range(is_range),
+        dummy_range(is_range, range_high, range_low),
         "fixture",
         False,
     )

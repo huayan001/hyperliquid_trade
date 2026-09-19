@@ -61,17 +61,23 @@ class MeanReversionStrategy(Strategy):
         atr_v = last_value(atr_s)
         bw_v = last_value(bw)
         recent = [x for x in bw[-20:] if x is not None]
-        if bw_v is not None and recent:
+        last_u = last_value(upper)
+        last_l = last_value(lower)
+        # 收盘仍在带外/区间外的大实体才视为急涨急跌「启动」；
+        # 收回带内的反转确认 K 即使实体较大也不停用（否则永远等不到确认）。
+        away = False
+        if last_u is not None and last.close > last_u:
+            away = True
+        if last_l is not None and last.close < last_l:
+            away = True
+        if rng is not None and rng.high > rng.low and (last.close > rng.high or last.close < rng.low):
+            away = True
+        if away and atr_v and body_exceeds_atr(last, atr_v, self.cfg.chase_body_atr) and bw_v is not None and recent:
             ranked = sorted(recent)
-            # 近 20 期高位区：位于分位 bandwidth_high_rank 以上
             idx = min(len(ranked) - 1, int(len(ranked) * self.cfg.bandwidth_high_rank))
             high_zone = ranked[idx]
-            if bw_v >= high_zone and atr_v and body_exceeds_atr(last, atr_v, self.cfg.chase_body_atr):
+            if bw_v >= high_zone or bw_v >= max(recent) * 0.9:
                 return True, "布林带带宽进入近20期高位且K实体>1.5×ATR，急涨/急跌启动，停用"
-
-        if atr_v and body_exceeds_atr(last, atr_v, self.cfg.chase_body_atr) and bw_v is not None and recent:
-            if bw_v >= max(recent) * 0.9:
-                return True, "带宽扩张且出现 1.5×ATR 实体，停用均值回归"
         return False, ""
 
     def generate_signal(

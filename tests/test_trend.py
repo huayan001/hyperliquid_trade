@@ -110,7 +110,7 @@ def test_trailing_stop_moves_half_atr_per_full_atr() -> None:
         side=Side.LONG,
         size=1,
         entry_price=100,
-        stop_price=90,
+        stop_price=80,  # 入场 − 2×ATR
         leverage=5,
         opened_ts=0,
     )

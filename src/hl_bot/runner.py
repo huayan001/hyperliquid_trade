@@ -52,7 +52,7 @@ class ScanReport:
 def _utc_keys(now: datetime | None = None) -> tuple[str, str, int]:
     now = now or datetime.now(timezone.utc)
     iso = now.isocalendar()
-    return now.strftime("%Y-%m-%d"), f"{iso.week_year}-W{iso.week:02d}", int(now.timestamp() * 1000)
+    return now.strftime("%Y-%m-%d"), f"{iso.year}-W{iso.week:02d}", int(now.timestamp() * 1000)
 
 
 def funding_against(side: Side, hourly_rate: float) -> bool:
@@ -118,6 +118,15 @@ class BotRunner:
 
             decision = route_regime(market.daily, market.h1, self.cfg.regime, symbol=symbol)
             notes: list[str] = [decision.reason]
+            if (
+                decision.range_structure
+                and decision.range_structure.is_range
+                and decision.hourly_adx is not None
+                and decision.hourly_adx >= self.cfg.regime.mr_adx_max
+            ):
+                notes.append(
+                    f"1h 虽有区间外形但 ADX={decision.hourly_adx:.1f}≥{self.cfg.regime.mr_adx_max}，不启用均值回归"
+                )
             if market.funding.annualized_24h:
                 notes.append(
                     f"资金费率 {market.funding.hourly_rate:.6%} /h "

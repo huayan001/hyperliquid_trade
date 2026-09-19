@@ -8,7 +8,8 @@ def _dump_then_reversal(*, confirm: bool) -> list[Candle]:
     candles = series_from_closes(closes, interval=H1, wick=0.002)
     last_ts = START + (len(closes) - 1) * H1
     if confirm:
-        candles[-1] = candle(90.0, open_=85.0, high=90.5, low=83.0, ts=last_ts, interval=H1)
+        # 收盘重新站回下轨之上，构成确认（不是触及当根）
+        candles[-1] = candle(94.0, open_=85.0, high=94.5, low=83.0, ts=last_ts, interval=H1)
     else:
         candles[-1] = candle(83.0, open_=85.0, high=85.2, low=82.5, ts=last_ts, interval=H1)
     return candles
@@ -18,13 +19,28 @@ def _rally_then_reversal() -> list[Candle]:
     closes = [100.0] * 30 + [102, 104, 107, 110, 113, 116]
     candles = series_from_closes(closes, interval=H1, wick=0.002)
     last_ts = START + (len(closes) - 1) * H1
-    candles[-1] = candle(111.0, open_=116.0, high=118.0, low=110.5, ts=last_ts, interval=H1)
+    # 收盘重新回到上轨之下
+    candles[-1] = candle(107.0, open_=116.0, high=118.0, low=106.5, ts=last_ts, interval=H1)
     return candles
+
+
+def _mr_dec(**kwargs):
+    defaults = dict(
+        daily_adx=12,
+        hourly_adx=14,
+        is_range=True,
+        ema_fast=100,
+        ema_slow=100.2,
+        range_high=130,
+        range_low=70,
+    )
+    defaults.update(kwargs)
+    return decision(Regime.MEAN_REVERSION, **defaults)
 
 
 def test_long_requires_reversal_confirmation() -> None:
     strat = MeanReversionStrategy()
-    dec = decision(Regime.MEAN_REVERSION, daily_adx=12, hourly_adx=14, is_range=True, ema_fast=100, ema_slow=100.2)
+    dec = _mr_dec()
     ok = strat.generate_signal(market("ETH", h1=_dump_then_reversal(confirm=True)), dec)
     no = strat.generate_signal(market("ETH", h1=_dump_then_reversal(confirm=False)), dec)
     assert ok is not None
@@ -36,7 +52,7 @@ def test_long_requires_reversal_confirmation() -> None:
 
 def test_short_is_range_fade_not_trend_break() -> None:
     strat = MeanReversionStrategy()
-    dec = decision(Regime.MEAN_REVERSION, daily_adx=11, hourly_adx=13, is_range=True, ema_fast=100, ema_slow=100.1)
+    dec = _mr_dec(daily_adx=11, hourly_adx=13)
     sig = strat.generate_signal(market("SOL", h1=_rally_then_reversal()), dec)
     assert sig is not None
     assert sig.side is Side.SHORT

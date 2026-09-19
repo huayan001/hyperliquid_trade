@@ -14,17 +14,17 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="hl-bot",
         description="Hyperliquid 永续合约机器人（趋势跟踪 + 均值回归，v1.1）",
     )
+    parser.add_argument(
+        "command",
+        choices=("scan", "run", "version"),
+        help="scan=拉一次行情并打印意图；run=循环；version=版本号",
+    )
     parser.add_argument("--config", default=None, help="config.toml 路径")
     parser.add_argument("--network", choices=("mainnet", "testnet"), default=None)
     parser.add_argument("--symbols", default=None, help="逗号分隔，如 BTC,ETH")
     parser.add_argument("--live", action="store_true", help="实盘下单（还需 HL_ENABLE_LIVE=1）")
+    parser.add_argument("--interval", type=int, default=None, help="run 轮询秒数，覆盖配置")
     parser.add_argument("-v", "--verbose", action="store_true")
-
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("scan", help="拉一次公开行情，打印制度/信号/模拟订单意图（默认不下单）")
-    run_p = sub.add_parser("run", help="按间隔循环扫描；dry-run 写入本地纸盘状态")
-    run_p.add_argument("--interval", type=int, default=None, help="轮询秒数，覆盖配置")
-    sub.add_parser("version", help="打印版本")
     return parser
 
 
