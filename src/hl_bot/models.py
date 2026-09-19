@@ -48,6 +48,7 @@ class IntentAction(str, Enum):
     OPEN = "open"
     CLOSE = "close"
     REDUCE = "reduce"
+    ADD = "add"
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +218,26 @@ class Position:
         direction = 1.0 if self.side is Side.LONG else -1.0
         return direction * (price - self.entry_price) * abs(self.size)
 
+    def original_size(self) -> float:
+        return float(self.extras.get("_opened_size") or self.size)
+
+    def favorable_move(self, price: float) -> float:
+        if self.side is Side.LONG:
+            return price - self.entry_price
+        return self.entry_price - price
+
+    def loss_risk_usd(self) -> float:
+        """止损被打到时的账户损失；止损已在保本以上则为 0。"""
+        if self.side is Side.LONG:
+            return max(0.0, (self.entry_price - self.stop_price) * abs(self.size))
+        return max(0.0, (self.stop_price - self.entry_price) * abs(self.size))
+
+    def pyramid_added_frac(self) -> float:
+        return float(self.extras.get("pyramid_added_frac") or 0.0)
+
+    def is_chase(self) -> bool:
+        return bool(self.extras.get("chase") or self.tag == "btc_chase_breakout")
+
 
 @dataclass
 class AccountState:
@@ -250,7 +271,4 @@ class AccountState:
         return max(0.0, (self.week_start_equity - self.equity) / self.week_start_equity)
 
     def open_risk_usd(self) -> float:
-        total = 0.0
-        for p in self.open_positions():
-            total += abs(p.entry_price - p.stop_price) * abs(p.size)
-        return total
+        return sum(p.loss_risk_usd() for p in self.open_positions())

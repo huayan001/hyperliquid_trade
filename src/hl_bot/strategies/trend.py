@@ -203,3 +203,87 @@ class TrendStrategy(Strategy):
                     )
                 ]
         return []
+
+    def trend_still_confirmed(self, position: Position, decision: RegimeDecision) -> bool:
+        """趋势指标继续确认：EMA 方向与持仓一致，且 ADX 未落到衰竭线以下。"""
+        if decision.daily_ema_fast is None or decision.daily_ema_slow is None:
+            return False
+        aligned = (
+            position.side is Side.LONG and decision.daily_ema_fast > decision.daily_ema_slow
+        ) or (position.side is Side.SHORT and decision.daily_ema_fast < decision.daily_ema_slow)
+        adx_ok = decision.daily_adx is not None and decision.daily_adx >= self.cfg.adx_exit
+        return aligned and adx_ok
+
+    def pyramid_breakeven_stop(self, avg_entry: float, atr_v: float, side: Side, current_stop: float) -> float:
+        """止损上移至加权均价保本以上（再加一小段 ATR 缓冲），且不往回拉。"""
+        buffer = max(self.cfg.pyramid_be_buffer_atr * atr_v, avg_entry * 1e-5)
+        if side is Side.LONG:
+            return max(current_stop, avg_entry + buffer)
+        return min(current_stop, avg_entry - buffer)
+
+    def generate_pyramid(
+        self,
+        position: Position,
+        market: MarketSnapshot,
+        decision: RegimeDecision,
+        now_ms: int | None = None,
+    ) -> Signal | None:
+        """
+        首仓浮盈 ≥ 1×ATR 且趋势仍确认 → 可加仓不超过首仓 50%。
+        急涨追突破首仓默认跳过；浮亏/无浮盈不得加仓（那是马丁）。
+        """
+        if not self.cfg.pyramid_enabled:
+            return None
+        if position.strategy is not StrategyName.TREND:
+            return None
+        if position.is_chase() and self.cfg.pyramid_skip_chase:
+            return None
+        original = position.original_size()
+        if original <= 0:
+            return None
+        already = position.pyramid_added_frac()
+        if already >= self.cfg.pyramid_max_frac - 1e-9:
+            return None
+        if not self.trend_still_confirmed(position, decision):
+            return None
+
+        h4 = last_closed(market.h4, now_ms) or list(market.h4)
+        atr_v = last_value(atr(h4, self.cfg.atr_period)) if h4 else None
+        if atr_v is None or atr_v <= 0:
+            return None
+        price = market.mid or (h4[-1].close if h4 else position.entry_price)
+        favorable = position.favorable_move(price)
+        if favorable <= 0:
+            return None
+        if favorable < self.cfg.pyramid_min_atr * atr_v:
+            return None
+
+        add_frac = min(self.cfg.pyramid_max_frac - already, self.cfg.pyramid_max_frac)
+        if add_frac <= 1e-9:
+            return None
+        add_size = original * add_frac
+        new_size = position.size + add_size
+        avg = (position.entry_price * position.size + price * add_size) / new_size
+        new_stop = self.pyramid_breakeven_stop(avg, atr_v, position.side, position.stop_price)
+        return Signal(
+            symbol=position.symbol,
+            strategy=StrategyName.TREND,
+            side=position.side,
+            kind=OrderKind.MAKER_LIMIT,
+            entry_price=price,
+            stop_price=new_stop,
+            reason=(
+                f"趋势金字塔加仓：浮盈 {favorable / atr_v:.2f}×ATR ≥ {self.cfg.pyramid_min_atr}×ATR，"
+                f"加仓不超过首仓 {self.cfg.pyramid_max_frac:.0%}，止损移至保本以上 {new_stop:.6g}"
+            ),
+            tag="pyramid_add",
+            extras={
+                "pyramid": True,
+                "atr": atr_v,
+                "add_frac": add_frac,
+                "add_size": add_size,
+                "original_size": original,
+                "avg_entry": avg,
+                "favorable": favorable,
+            },
+        )

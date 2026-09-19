@@ -41,6 +41,14 @@ weekly_loss_delever = 0.10
 funding_annual_warn = 0.50
 # 高资金费时仓位下调系数（不做马丁，只缩小）
 funding_size_mult = 0.5
+# 持仓期资金费异常飙升（年化或 24h 均 ≥ 上项）→ 提前离场
+funding_exit_enabled = true
+# 金字塔加仓（文档 2.4 可选进阶）：浮盈≥1×ATR 且趋势仍确认，加仓≤首仓 50%
+pyramid_enabled = true
+pyramid_min_atr = 1.0
+pyramid_max_frac = 0.5
+pyramid_skip_chase = true
+pyramid_be_buffer_atr = 0.05
 
 [mean_reversion]
 bb_period = 20
@@ -62,6 +70,8 @@ daily_loss_halt = 0.03
 leverage_cap = 5
 chase_body_atr = 1.5
 bandwidth_high_rank = 0.80   # 近 20 期高位区
+# 震荡持仓短，默认不因资金费提前离场；需要时可打开
+funding_exit_enabled = false
 
 [risk]
 isolated = true

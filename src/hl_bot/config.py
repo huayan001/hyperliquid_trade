@@ -79,6 +79,12 @@ class TrendConfig:
     weekly_loss_delever: float = 0.10
     funding_annual_warn: float = 0.50
     funding_size_mult: float = 0.5
+    funding_exit_enabled: bool = True
+    pyramid_enabled: bool = True
+    pyramid_min_atr: float = 1.0
+    pyramid_max_frac: float = 0.5
+    pyramid_skip_chase: bool = True
+    pyramid_be_buffer_atr: float = 0.05
 
 
 @dataclass(slots=True)
@@ -102,6 +108,7 @@ class MeanReversionConfig:
     leverage_cap: int = 5
     chase_body_atr: float = 1.5
     bandwidth_high_rank: float = 0.80
+    funding_exit_enabled: bool = False
 
 
 @dataclass(slots=True)
@@ -216,6 +223,12 @@ def load_config(
             weekly_loss_delever=_as_float(trend_raw.get("weekly_loss_delever"), 0.10),
             funding_annual_warn=_as_float(trend_raw.get("funding_annual_warn"), 0.50),
             funding_size_mult=_as_float(trend_raw.get("funding_size_mult"), 0.5),
+            funding_exit_enabled=_as_bool(trend_raw.get("funding_exit_enabled"), True),
+            pyramid_enabled=_as_bool(trend_raw.get("pyramid_enabled"), True),
+            pyramid_min_atr=_as_float(trend_raw.get("pyramid_min_atr"), 1.0),
+            pyramid_max_frac=_as_float(trend_raw.get("pyramid_max_frac"), 0.5),
+            pyramid_skip_chase=_as_bool(trend_raw.get("pyramid_skip_chase"), True),
+            pyramid_be_buffer_atr=_as_float(trend_raw.get("pyramid_be_buffer_atr"), 0.05),
         ),
         mean_reversion=MeanReversionConfig(
             bb_period=_as_int(mr_raw.get("bb_period"), 20),
@@ -237,6 +250,7 @@ def load_config(
             leverage_cap=_as_int(mr_raw.get("leverage_cap"), 5),
             chase_body_atr=_as_float(mr_raw.get("chase_body_atr"), 1.5),
             bandwidth_high_rank=_as_float(mr_raw.get("bandwidth_high_rank"), 0.80),
+            funding_exit_enabled=_as_bool(mr_raw.get("funding_exit_enabled"), False),
         ),
         risk=RiskConfig(
             isolated=_as_bool(risk_raw.get("isolated"), True),

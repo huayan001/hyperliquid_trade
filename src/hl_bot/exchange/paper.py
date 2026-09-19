@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 from hl_bot.models import AccountState, IntentAction, OrderIntent, Position, Side, StrategyName
-from hl_bot.risk import apply_close, apply_fill
+from hl_bot.risk import apply_close, apply_fill, apply_pyramid
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,21 @@ class PaperBroker:
                 intent.leverage,
             )
             return {"status": "paper", "action": "open"}
+
+        if intent.action is IntentAction.ADD:
+            pos = self.account.position_for(intent.symbol)
+            if pos is None:
+                return {"status": "paper", "action": "missing_position"}
+            apply_pyramid(self.account, pos, intent.size, intent.price, intent.stop_price or pos.stop_price)
+            logger.info(
+                "PAPER 金字塔加仓 %s +%.6g @ %.6g avg=%.6g stop=%.6g",
+                intent.symbol,
+                intent.size,
+                intent.price,
+                pos.entry_price,
+                pos.stop_price,
+            )
+            return {"status": "paper", "action": "add"}
 
         pos = self.account.position_for(intent.symbol)
         if pos is None:

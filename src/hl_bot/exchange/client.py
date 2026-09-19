@@ -214,8 +214,16 @@ class HyperliquidClient:
             sl_is_buy = not is_buy
             stop_px = float(f"{intent.stop_price:.5g}")
             sl_type = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}
+            old_oid = intent.extras.get("sl_oid")
+            if old_oid is not None:
+                try:
+                    self._exchange.cancel(intent.symbol, int(old_oid))
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("取消旧止损单 %s 失败: %s", old_oid, exc)
+            sl_sz = float(intent.extras.get("total_size") or size)
+            sl_sz = self.round_size(intent.symbol, sl_sz, sz_decimals)
             sl = self._exchange.order(
-                intent.symbol, sl_is_buy, size, stop_px, sl_type, reduce_only=True
+                intent.symbol, sl_is_buy, sl_sz, stop_px, sl_type, reduce_only=True
             )
             return {"status": "ok", "order": result, "stop": sl}
         return result

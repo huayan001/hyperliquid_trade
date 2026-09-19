@@ -19,6 +19,12 @@ from hl_bot.models import (
     Signal,
     StrategyName,
 )
+from hl_bot.funding import (
+    funding_against,
+    funding_exit_enabled_for,
+    make_funding_exit_intent,
+    should_exit_on_funding_spike,
+)
 from hl_bot.regime import route_regime
 from hl_bot.risk import RiskManager
 from hl_bot.strategies.mean_reversion import MeanReversionStrategy
@@ -53,13 +59,6 @@ def _utc_keys(now: datetime | None = None) -> tuple[str, str, int]:
     now = now or datetime.now(timezone.utc)
     iso = now.isocalendar()
     return now.strftime("%Y-%m-%d"), f"{iso.year}-W{iso.week:02d}", int(now.timestamp() * 1000)
-
-
-def funding_against(side: Side, hourly_rate: float) -> bool:
-    # 正资金费率：多头付给空头
-    if side is Side.LONG:
-        return hourly_rate > 0
-    return hourly_rate < 0
 
 
 class BotRunner:
@@ -134,12 +133,35 @@ class BotRunner:
                 )
 
             exits = self._exits_for(market, decision, now_ms)
-            for intent in exits:
-                self._execute(intent, now_ms, persist_paper=persist_paper)
+            for item in exits:
+                self._execute(item, now_ms, persist_paper=persist_paper)
 
+            closing = any(
+                e.action.value in {"close", "reduce"} and not e.extras.get("trail_update_only") for e in exits
+            )
             signal: Signal | None = None
             intent: OrderIntent | None = None
-            if decision.regime.is_trend():
+            existing = self.account.position_for(symbol)
+            if closing:
+                notes.append("本轮已有离场意图，不再开新仓或金字塔加仓")
+            elif existing is not None:
+                if existing.strategy is StrategyName.TREND:
+                    signal = self.trend.generate_pyramid(existing, market, decision, now_ms)
+                    if signal is not None:
+                        verdict = self.risk.evaluate_pyramid(signal, existing, self.account)
+                        if verdict.allowed:
+                            intent = self.risk.to_pyramid_intent(
+                                signal, existing, verdict, isolated=self.cfg.risk.isolated
+                            )
+                            if intent:
+                                self._execute(intent, now_ms, persist_paper=persist_paper)
+                        else:
+                            notes.append(f"金字塔拒绝：{verdict.reason}")
+                    else:
+                        notes.append("已有趋势仓，等待金字塔条件或离场（禁止摊平）")
+                else:
+                    notes.append("已有仓位，禁止摊平加仓")
+            elif decision.regime.is_trend():
                 signal = self.trend.generate_signal(market, decision, now_ms)
             elif decision.regime is Regime.MEAN_REVERSION:
                 halted, why = self.mr.expansion_halt(market.h1, decision)
@@ -150,7 +172,7 @@ class BotRunner:
             else:
                 notes.append("中间地带/冲突：不新开仓")
 
-            if signal is not None:
+            if signal is not None and existing is None and not closing:
                 against = funding_against(signal.side, market.funding.hourly_rate)
                 huge_funding = (
                     against
@@ -205,8 +227,26 @@ class BotRunner:
         if pos is None:
             return []
         if pos.strategy is StrategyName.TREND:
-            return self.trend.generate_exits(pos, market, decision, now_ms)
-        return self.mr.generate_exits(pos, market, decision, now_ms)
+            exits = self.trend.generate_exits(pos, market, decision, now_ms)
+        else:
+            exits = self.mr.generate_exits(pos, market, decision, now_ms)
+        if any(e.action.value == "close" for e in exits):
+            return exits
+        enabled = funding_exit_enabled_for(
+            pos,
+            self.cfg.trend.funding_exit_enabled,
+            self.cfg.mean_reversion.funding_exit_enabled,
+        )
+        spike, why = should_exit_on_funding_spike(
+            pos,
+            market.funding,
+            threshold=self.cfg.trend.funding_annual_warn,
+            enabled=enabled,
+        )
+        if spike:
+            price = market.mid or pos.entry_price
+            return [make_funding_exit_intent(pos, price, why)]
+        return exits
 
     def _execute(self, intent: OrderIntent, now_ms: int, *, persist_paper: bool = False) -> None:
         if intent.extras.get("trail_update_only"):
@@ -238,9 +278,12 @@ class BotRunner:
 
 
 def _format_intent(intent: OrderIntent) -> str:
-    side = "买入开多" if intent.side is Side.LONG and intent.action.value == "open" else intent.side.value
     if intent.action.value == "open":
         side = "买入开多" if intent.side is Side.LONG else "卖出开空"
+    elif intent.action.value == "add":
+        side = "金字塔加多" if intent.side is Side.LONG else "金字塔加空"
+    else:
+        side = intent.side.value
     return (
         f"{intent.action.value} {side} {intent.size:.6g} {intent.symbol} @ {intent.price:.6g} "
         f"({intent.kind.value}) stop={intent.stop_price} lev={intent.leverage}x "
