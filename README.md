@@ -52,6 +52,7 @@ src/hl_bot/
   strategies/mean_reversion.py 均值回归
   risk.py                      仓位与组合限制
   exchange/client.py           Hyperliquid REST + SDK
+  exchange/equity.py           实盘权益（对齐 App「可用」；纸盘不走这里）
   runner.py / cli.py           扫描与循环
 config.toml                    可调参数（不要把密钥写进来）
 .env.example                   环境变量模板
@@ -69,13 +70,27 @@ cp .env.example .env
 |---|---|
 | `HL_NETWORK` | `mainnet` 或 `testnet` |
 | `HL_DRY_RUN` | 默认 `true` |
-| `HL_PAPER_EQUITY` | 无账户时的模拟权益，默认 `10000` |
+| `HL_PAPER_EQUITY` | dry-run / 纸盘模拟权益，默认 `10000`。实盘扫描改读交易所权益，见下节 |
 | `HL_SYMBOLS` | 默认 `BTC,ETH,SOL,HYPE` |
 | `HL_PRIVATE_KEY` | 仅实盘需要 |
 | `HL_ACCOUNT_ADDRESS` | 使用 API Wallet / Agent 时填**主账户**地址 |
 | `HL_ENABLE_LIVE` | 实盘总闸，必须为 `1` 且命令行加 `--live` |
 
 标的、ADX 阈值、风险比例等见 `config.toml`。
+
+## 实盘权益（对齐 App「可用」）
+
+`--live` 扫描打印的「账户权益」用于单笔风险% 反推仓位，必须接近 App 永续下单页的 **可用**，而不是永续清算所里的 `accountValue`。
+
+Hyperliquid 推荐大多数用户使用 **unified account**：现货 USDC 与永续保证金是同一桶。此时 `clearinghouseState.marginSummary.accountValue` 经常是 `0`（官方说明：unified / portfolio margin 下单个 perp dex 的 user state 没有意义；余额真相在 `spotClearinghouseState`）。空仓时 App「可用」≈ 现货 USDC `total - hold`。
+
+公式（`src/hl_bot/exchange/equity.py`，避免重复计数）：
+
+- **unified / portfolio margin**：`free_spot_usdc = USDC.total − USDC.hold`（不加 perps）
+- **标准分账户**（或读不到模式）：`perps accountValue + free_spot_usdc`
+- 任一侧 /info 失败（含 429）：用读到的一侧；两侧都失败或「perps=0 且现货失败」则回退本地 fallback，**不会静默显示 $0**
+
+dry-run / `hl-bot run` 纸盘仍用 `HL_PAPER_EQUITY` 与 `state/paper_state.json`，不走该公式。
 
 ## 建议顺序：dry-run → 测试网 → 主网
 
