@@ -31,3 +31,10 @@ def test_funding_exit_defaults_split_by_strategy() -> None:
     assert cfg.mean_reversion.funding_exit_enabled is True
     assert cfg.mean_reversion.funding_annual_exit == 0.50
     assert cfg.trend.funding_annual_exit > cfg.trend.funding_annual_warn
+
+
+def test_trend_starter_defaults_and_toml() -> None:
+    cfg = load_config("config.toml")
+    assert cfg.trend.starter_enabled is True
+    assert abs(cfg.trend.starter_frac - 0.35) < 1e-12
+    assert cfg.trend.starter_symbols == ()

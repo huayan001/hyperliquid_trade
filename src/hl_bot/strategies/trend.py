@@ -1,4 +1,4 @@
-"""趋势跟踪波段（v1.1）：4h Donchian 收盘突破，禁止等 EMA 回撤；BTC 急涨可追。"""
+"""趋势跟踪波段（v1.1）：日线确认可先 starter，4h Donchian 收盘突破补满；禁止等 EMA 回撤。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,101 @@ class TrendStrategy(Strategy):
         market: MarketSnapshot,
         decision: RegimeDecision,
         now_ms: int | None = None,
+        existing: Position | None = None,
     ) -> Signal | None:
+        # 已有仓不得再发满仓开仓信号；starter 补仓走 generate_breakout_add。
+        if existing is not None:
+            return None
+        prepared = self._prepare(market, decision, now_ms)
+        if prepared is None:
+            return None
+        last, atr_v, upper, lower, daily_adx, side = prepared
+        if self._donchian_confirmed(side, last, upper, lower):
+            band = upper if side is Side.LONG else lower
+            return self._build_breakout_signal(market, last, atr_v, side, band, daily_adx)
+        return self._maybe_starter(market, last, atr_v, side, upper if side is Side.LONG else lower, daily_adx)
+
+    def generate_breakout_add(
+        self,
+        position: Position,
+        market: MarketSnapshot,
+        decision: RegimeDecision,
+        now_ms: int | None = None,
+    ) -> Signal | None:
+        """第一档 starter 已开：仅在 4h Donchian 收盘突破时补剩余计划仓，禁止再开一笔满仓。"""
+        if not position.starter_pending():
+            return None
+        if position.strategy is not StrategyName.TREND:
+            return None
+        prepared = self._prepare(market, decision, now_ms)
+        if prepared is None:
+            return None
+        last, atr_v, upper, lower, daily_adx, side = prepared
+        if side is not position.side:
+            return None
+        if not self._donchian_confirmed(side, last, upper, lower):
+            return None
+
+        starter_frac = float(position.extras.get("starter_frac") or self.cfg.starter_frac)
+        intended_full = position.intended_full_size()
+        add_size = intended_full - position.size
+        if add_size <= 1e-12:
+            return None
+
+        chase = (
+            market.symbol.upper() in {s.upper() for s in self.cfg.chase_symbols}
+            and body_exceeds_atr(last, atr_v, self.cfg.chase_body_atr)
+        )
+        if chase:
+            kind = OrderKind.MARKET
+            tag = "donchian_close_breakout"
+            how = f"突破K实体{last.body:.4g}> {self.cfg.chase_body_atr}×ATR，第二档市价补仓"
+        else:
+            kind = OrderKind.MAKER_LIMIT
+            tag = "donchian_close_breakout"
+            how = "收盘突破 Donchian20，第二档补剩余仓；共用已有止损"
+
+        band = upper if side is Side.LONG else lower
+        direction = "做多" if side is Side.LONG else "做空"
+        remaining_frac = max(0.0, 1.0 - starter_frac)
+        reason = (
+            f"趋势分层第二档 {tag}：{direction} 4h Donchian{self.cfg.donchian_period} 收盘确认"
+            f"（收盘{last.close:.6g} vs 通道{'上' if side is Side.LONG else '下'}轨{band:.6g}）。"
+            f"在 starter 之上补约 {remaining_frac:.0%} 计划仓（size≈{add_size:.6g} @ {last.close:.6g}）。{how}"
+        )
+        return Signal(
+            symbol=market.symbol,
+            strategy=StrategyName.TREND,
+            side=side,
+            kind=kind,
+            entry_price=last.close,
+            stop_price=position.stop_price,
+            reason=reason,
+            tag=tag,
+            extras={
+                "atr": atr_v,
+                "donchian_band": band,
+                "chase": chase,
+                "daily_adx": daily_adx,
+                "forbid_ema_pullback": True,
+                "tier": "donchian_close_breakout",
+                "tier_add": True,
+                "breakout_add": True,
+                "add_size": add_size,
+                "original_size": position.original_size(),
+                "intended_full_size": intended_full,
+                "starter_frac": starter_frac,
+                "shared_stop": True,
+                "pyramid": False,
+            },
+        )
+
+    def _prepare(
+        self,
+        market: MarketSnapshot,
+        decision: RegimeDecision,
+        now_ms: int | None,
+    ) -> tuple | None:
         if not decision.regime.is_trend():
             return None
 
@@ -56,26 +150,84 @@ class TrendStrategy(Strategy):
         side = decision.regime.trend_side()
         if side is None:
             return None
+        if side is Side.LONG and decision.regime is not Regime.TREND_LONG:
+            return None
+        if side is Side.SHORT:
+            if decision.regime is not Regime.TREND_SHORT:
+                return None
+            if market.symbol.upper() == "BTC":
+                if daily_adx is None or daily_adx <= self.cfg.btc_short_adx_min:
+                    return None
+        return last, atr_v, upper, lower, daily_adx, side
 
-        # v1.1：入场只看收盘突破，明确不要求价格回到 EMA。
+    @staticmethod
+    def _donchian_confirmed(side: Side, last, upper: float, lower: float) -> bool:
         if side is Side.LONG:
-            if decision.regime is not Regime.TREND_LONG:
-                return None
-            if last.close <= upper:
-                return None
-            return self._build_signal(market, last, atr_v, Side.LONG, upper, daily_adx)
+            return last.close > upper
+        return last.close < lower
 
-        # 做空：仅空头环境；BTC 额外要求 ADX>25
-        if decision.regime is not Regime.TREND_SHORT:
-            return None
-        if market.symbol.upper() == "BTC":
-            if daily_adx is None or daily_adx <= self.cfg.btc_short_adx_min:
-                return None
-        if last.close >= lower:
-            return None
-        return self._build_signal(market, last, atr_v, Side.SHORT, lower, daily_adx)
+    def _starter_allowed_for(self, symbol: str) -> bool:
+        if not self.cfg.starter_enabled:
+            return False
+        frac = self.cfg.starter_frac
+        if frac <= 0.0 or frac >= 1.0:
+            return False
+        allow = tuple(s.upper() for s in self.cfg.starter_symbols)
+        if not allow:
+            return True
+        return symbol.upper() in allow
 
-    def _build_signal(
+    def _maybe_starter(
+        self,
+        market: MarketSnapshot,
+        last,
+        atr_v: float,
+        side: Side,
+        band: float,
+        daily_adx: float | None,
+    ) -> Signal | None:
+        if not self._starter_allowed_for(market.symbol):
+            return None
+        entry = market.mid if market.mid > 0 else last.close
+        if entry <= 0:
+            return None
+        frac = self.cfg.starter_frac
+        if side is Side.LONG:
+            stop = entry - self.cfg.stop_atr * atr_v
+            direction = "做多"
+        else:
+            stop = entry + self.cfg.stop_atr * atr_v
+            direction = "做空"
+        reason = (
+            f"趋势分层第一档 trend_confirmed_starter：日线趋势已确认（{direction}），"
+            f"4h Donchian{self.cfg.donchian_period} 收盘突破尚未触发"
+            f"（收盘{last.close:.6g} vs 通道{'上' if side is Side.LONG else '下'}轨{band:.6g}，mid={entry:.6g}）。"
+            f"市价试探仓约为计划满仓的 {frac:.0%}，止损仍 {self.cfg.stop_atr:g}×ATR。"
+        )
+        return Signal(
+            symbol=market.symbol,
+            strategy=StrategyName.TREND,
+            side=side,
+            kind=OrderKind.MARKET,
+            entry_price=entry,
+            stop_price=stop,
+            reason=reason,
+            tag="trend_confirmed_starter",
+            extras={
+                "atr": atr_v,
+                "donchian_band": band,
+                "chase": False,
+                "daily_adx": daily_adx,
+                "forbid_ema_pullback": True,
+                "starter": True,
+                "starter_frac": frac,
+                "size_frac": frac,
+                "tier": "trend_confirmed_starter",
+                "starter_pending_add": True,
+            },
+        )
+
+    def _build_breakout_signal(
         self,
         market: MarketSnapshot,
         last,
@@ -107,7 +259,7 @@ class TrendStrategy(Strategy):
             direction = "做空"
 
         reason = (
-            f"趋势{direction}：4h Donchian{self.cfg.donchian_period} 收盘确认"
+            f"趋势{direction}第二档/整笔 {tag}：4h Donchian{self.cfg.donchian_period} 收盘确认"
             f"（收盘{last.close:.6g} vs 通道{'上' if side is Side.LONG else '下'}轨{band:.6g}）。{how}"
         )
         return Signal(
@@ -125,6 +277,9 @@ class TrendStrategy(Strategy):
                 "chase": chase,
                 "daily_adx": daily_adx,
                 "forbid_ema_pullback": True,
+                "tier": tag,
+                "starter": False,
+                "size_frac": 1.0,
             },
         )
 
@@ -231,10 +386,13 @@ class TrendStrategy(Strategy):
         """
         首仓浮盈 ≥ 1×ATR 且趋势仍确认 → 可加仓不超过首仓 50%。
         急涨追突破首仓默认跳过；浮亏/无浮盈不得加仓（那是马丁）。
+        starter 未补满前不加金字塔，只等 Donchian 第二档。
         """
         if not self.cfg.pyramid_enabled:
             return None
         if position.strategy is not StrategyName.TREND:
+            return None
+        if position.starter_pending():
             return None
         if position.is_chase() and self.cfg.pyramid_skip_chase:
             return None

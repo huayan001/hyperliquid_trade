@@ -50,6 +50,11 @@ pyramid_min_atr = 1.0
 pyramid_max_frac = 0.5
 pyramid_skip_chase = true
 pyramid_be_buffer_atr = 0.05
+# 分层入场：日线趋势确认后先市价试探仓；4h Donchian 收盘突破再补剩余
+starter_enabled = true
+starter_frac = 0.35
+# 空列表 = 所有趋势标的；可写成 ["BTC", "ETH"] 只对部分品种启用
+starter_symbols = []
 
 [mean_reversion]
 bb_period = 20
