@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from hl_bot.config import BotConfig
+from hl_bot.exchange.equity import combine_live_equity
 from hl_bot.models import Candle, FundingInfo, MarketSnapshot, OrderIntent, OrderKind, Side
 
 logger = logging.getLogger(__name__)
@@ -237,19 +238,94 @@ class HyperliquidClient:
             max_leverage=int(info.get("max_leverage") or self.cfg.max_leverage_for(symbol)),
         )
 
+    def _fetch_info(self, payload: dict[str, Any]) -> Any:
+        """公开 /info；调用方若已 connect_sdk，优先走官方 SDK。"""
+        info_type = str(payload.get("type") or "")
+        if self._info is not None:
+            if info_type == "clearinghouseState" and hasattr(self._info, "user_state"):
+                return self._info.user_state(payload["user"])
+            if info_type == "spotClearinghouseState" and hasattr(self._info, "spot_user_state"):
+                return self._info.spot_user_state(payload["user"])
+        return self._post_info(payload)
+
+    def _safe_info(self, payload: dict[str, Any], *, label: str) -> tuple[Any, str | None]:
+        try:
+            return self._fetch_info(payload), None
+        except Exception as exc:
+            logger.warning("读取%s失败: %s", label, exc)
+            return None, f"{label}: {exc}"
+
     def account_equity(self, fallback: float) -> float:
+        """实盘权益对齐 App「可用」：perps accountValue + 可用现货 USDC（按账户模式去重）。
+
+        dry-run / 无地址时原样返回 fallback，纸盘路径不变。
+        任一 /info 失败时：能读到的一侧仍计入；两侧都失败或结果为 0 且有失败则回退 fallback，
+        避免「现货其实有 USDC、却因 perps=0 / 429 静默显示 $0」。
+        """
         if self.cfg.dry_run or not self.cfg.account_address:
             return fallback
+
         try:
             self.connect_sdk(for_trading=False)
-            if self._info is None:
-                raw = self._post_info({"type": "clearinghouseState", "user": self.cfg.account_address})
-            else:
-                raw = self._info.user_state(self.cfg.account_address)
-            return float(raw["marginSummary"]["accountValue"])
         except Exception as exc:  # pragma: no cover
-            logger.warning("读取账户权益失败，回退模拟权益: %s", exc)
+            logger.debug("connect_sdk 跳过，改走 REST /info: %s", exc)
+
+        address = self.cfg.account_address
+        errors: list[str] = []
+        perps_raw, perps_err = self._safe_info(
+            {"type": "clearinghouseState", "user": address},
+            label="perps clearinghouseState",
+        )
+        spot_raw, spot_err = self._safe_info(
+            {"type": "spotClearinghouseState", "user": address},
+            label="spotClearinghouseState",
+        )
+        if perps_err:
+            errors.append(perps_err)
+        if spot_err:
+            errors.append(spot_err)
+
+        if perps_raw is None and spot_raw is None:
+            logger.warning("读取账户权益失败，回退模拟权益: %s", "; ".join(errors))
             return fallback
+
+        abstraction = None
+        # 仅当两侧都有正数时才需要模式，用来避免 unified 下同一桶 USDC 加两次
+        preview = combine_live_equity(perps_raw, spot_raw, None)
+        if preview.perps_value > 0 and preview.free_spot_usdc > 0:
+            abstraction, abs_err = self._safe_info(
+                {"type": "userAbstraction", "user": address},
+                label="userAbstraction",
+            )
+            if abs_err:
+                logger.info("未读到账户模式，按标准账户相加 perps+现货: %s", abs_err)
+
+        breakdown = combine_live_equity(perps_raw, spot_raw, abstraction)
+        if breakdown.equity <= 0 and errors:
+            logger.warning(
+                "权益计算结果为 0 且部分接口失败，回退模拟权益: %s",
+                "; ".join(errors),
+            )
+            return fallback
+
+        logger.info(
+            "实盘权益 $%.2f [%s] 计入=%s perps=$%.2f 可用现货USDC=$%.2f abstraction=%s",
+            breakdown.equity,
+            breakdown.formula,
+            ",".join(breakdown.included) or "none",
+            breakdown.perps_value,
+            breakdown.free_spot_usdc,
+            breakdown.abstraction or "unknown",
+        )
+        logger.debug(
+            "权益明细 formula=%s perps=%s spot=%s abstraction=%s errors=%s",
+            breakdown.formula,
+            breakdown.perps_value,
+            breakdown.free_spot_usdc,
+            breakdown.abstraction,
+            errors or None,
+        )
+        return breakdown.equity
 
     def round_size(self, symbol: str, size: float, sz_decimals: int | None = None) -> float:
         dec = sz_decimals if sz_decimals is not None else 4
