@@ -7,7 +7,7 @@ from hl_bot.exchange.equity import (
 )
 
 
-def _perps(*, account_value: float = 0.0, cross: float | None = None, withdrawable: float = 0.0) -> dict:
+def _perps(account_value: float = 0.0, cross: float | None = None, withdrawable: float = 0.0) -> dict:
     return {
         "marginSummary": {"accountValue": str(account_value)},
         "crossMarginSummary": {"accountValue": str(cross if cross is not None else account_value)},
