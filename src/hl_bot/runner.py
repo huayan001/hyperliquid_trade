@@ -148,23 +148,41 @@ class BotRunner:
                 notes.append("本轮已有离场意图，不再开新仓或金字塔加仓")
             elif existing is not None:
                 if existing.strategy is StrategyName.TREND:
-                    signal = self.trend.generate_pyramid(existing, market, decision, now_ms)
-                    if signal is not None:
-                        verdict = self.risk.evaluate_pyramid(signal, existing, self.account)
-                        if verdict.allowed:
-                            intent = self.risk.to_pyramid_intent(
-                                signal, existing, verdict, isolated=self.cfg.risk.isolated
-                            )
-                            if intent:
-                                self._execute(intent, now_ms, persist_paper=persist_paper)
+                    if existing.starter_pending():
+                        signal = self.trend.generate_breakout_add(existing, market, decision, now_ms)
+                        if signal is not None:
+                            verdict = self.risk.evaluate_tier_add(signal, existing, self.account)
+                            if verdict.allowed:
+                                intent = self.risk.to_tier_add_intent(
+                                    signal, existing, verdict, isolated=self.cfg.risk.isolated
+                                )
+                                if intent:
+                                    self._execute(intent, now_ms, persist_paper=persist_paper)
+                            else:
+                                notes.append(f"突破补仓拒绝：{verdict.reason}")
                         else:
-                            notes.append(f"金字塔拒绝：{verdict.reason}")
+                            notes.append(
+                                "已有趋势 starter，等待 4h Donchian 收盘突破补剩余仓"
+                                "（禁止二次满仓开仓，突破未触发则沿用现有止损）"
+                            )
                     else:
-                        notes.append("已有趋势仓，等待金字塔条件或离场（禁止摊平）")
+                        signal = self.trend.generate_pyramid(existing, market, decision, now_ms)
+                        if signal is not None:
+                            verdict = self.risk.evaluate_pyramid(signal, existing, self.account)
+                            if verdict.allowed:
+                                intent = self.risk.to_pyramid_intent(
+                                    signal, existing, verdict, isolated=self.cfg.risk.isolated
+                                )
+                                if intent:
+                                    self._execute(intent, now_ms, persist_paper=persist_paper)
+                            else:
+                                notes.append(f"金字塔拒绝：{verdict.reason}")
+                        else:
+                            notes.append("已有趋势仓，等待金字塔条件或离场（禁止摊平）")
                 else:
                     notes.append("已有仓位，禁止摊平加仓")
             elif decision.regime.is_trend():
-                signal = self.trend.generate_signal(market, decision, now_ms)
+                signal = self.trend.generate_signal(market, decision, now_ms, existing=existing)
             elif decision.regime is Regime.MEAN_REVERSION:
                 halted, why = self.mr.expansion_halt(market.h1, decision)
                 if halted:
@@ -260,9 +278,12 @@ class BotRunner:
                 self.broker.submit(intent, now_ms)
             return
         pos_side = intent.position_side()
+        tag = str(intent.extras.get("tag") or intent.extras.get("tier") or "")
+        tier = str(intent.extras.get("tier") or tag)
         self.alerts.send(
             f"{intent.action.value} {intent.symbol} {pos_side.value} "
-            f"({_action_side_label(intent)}) {intent.reason}"
+            f"({_action_side_label(intent)}) tier={tier or '-'} tag={tag or '-'} "
+            f"size={intent.size:.6g} @ {intent.price:.6g} {intent.reason}"
         )
         if self.cfg.dry_run:
             logger.info("DRY-RUN 意图: %s", _format_intent(intent))
@@ -306,6 +327,8 @@ def _action_side_label(intent: OrderIntent) -> str:
     if intent.action is IntentAction.OPEN:
         return "买入开多" if pos is Side.LONG else "卖出开空"
     if intent.action is IntentAction.ADD:
+        if intent.extras.get("tier_add") or intent.extras.get("breakout_add"):
+            return "突破补仓加多" if pos is Side.LONG else "突破补仓加空"
         return "金字塔加多" if pos is Side.LONG else "金字塔加空"
     if intent.action is IntentAction.CLOSE:
         return "平多" if pos is Side.LONG else "平空"
@@ -316,9 +339,12 @@ def _action_side_label(intent: OrderIntent) -> str:
 
 def _format_intent(intent: OrderIntent) -> str:
     side = _action_side_label(intent)
+    tag = str(intent.extras.get("tag") or intent.extras.get("tier") or "")
+    tier = str(intent.extras.get("tier") or tag)
     return (
         f"{intent.action.value} {side} {intent.size:.6g} {intent.symbol} @ {intent.price:.6g} "
-        f"({intent.kind.value}) stop={intent.stop_price} lev={intent.leverage}x "
+        f"({intent.kind.value}) tier={tier or '-'} tag={tag or '-'} "
+        f"stop={intent.stop_price} lev={intent.leverage}x "
         f"{'isolated' if intent.isolated else 'cross'} 风险=${intent.risk_usd:.2f}"
     )
 
@@ -351,8 +377,8 @@ def format_report(report: ScanReport) -> str:
         if item.signal:
             lines.append(
                 f"  信号: {item.signal.side.value} / {item.signal.strategy.value} / "
-                f"{item.signal.kind.value}  入场={item.signal.entry_price:.6g}  "
-                f"止损={item.signal.stop_price:.6g}"
+                f"{item.signal.kind.value} / tag={item.signal.tag or '-'}  "
+                f"入场={item.signal.entry_price:.6g}  止损={item.signal.stop_price:.6g}"
             )
             lines.append(f"       {item.signal.reason}")
         else:

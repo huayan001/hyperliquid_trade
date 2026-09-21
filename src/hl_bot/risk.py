@@ -121,6 +121,8 @@ class RiskManager:
         size_mult = scale
         if funding_against:
             size_mult *= self.cfg.trend.funding_size_mult
+        if signal.strategy is StrategyName.TREND:
+            size_mult *= self._trend_open_frac(signal)
 
         max_lev = max_leverage_hint or self.cfg.max_leverage_for(signal.symbol)
         if signal.strategy is StrategyName.MEAN_REVERSION:
@@ -144,6 +146,125 @@ class RiskManager:
                 return RiskDecision(False, "组合潜在止损损失将超过账户 6%")
 
         return RiskDecision(True, "风控通过", sized, sized.risk_pct, scale)
+
+    def _trend_open_frac(self, signal: Signal) -> float:
+        """starter 按计划满仓的一小部分计风险；整笔突破仍为 1。"""
+        if signal.extras.get("starter"):
+            frac = float(signal.extras.get("starter_frac") or self.cfg.trend.starter_frac)
+        else:
+            frac = float(signal.extras.get("size_frac") or 1.0)
+        if frac <= 0.0:
+            return 1.0
+        return min(frac, 1.0)
+
+    def evaluate_tier_add(
+        self,
+        signal: Signal,
+        position: Position,
+        account: AccountState,
+    ) -> RiskDecision:
+        """starter 之后的 Donchian 补仓：允许把风险补到原计划满仓，但不得超过组合上限。"""
+        if not position.starter_pending():
+            return RiskDecision(False, "仅待补仓的趋势 starter 允许 Donchian 补仓")
+        if position.symbol != signal.symbol or position.side is not signal.side:
+            return RiskDecision(False, "补仓必须与已有仓同标的同向")
+        if position.strategy is not StrategyName.TREND:
+            return RiskDecision(False, "仅趋势仓允许分层补仓")
+
+        intended_full = float(signal.extras.get("intended_full_size") or position.intended_full_size())
+        remaining = intended_full - position.size
+        add_size = float(signal.extras.get("add_size") or remaining)
+        add_size = min(add_size, remaining)
+        scale = self.leverage_scale(account, StrategyName.TREND)
+        add_size *= scale
+        if add_size <= 1e-12:
+            return RiskDecision(False, "starter 已达计划满仓，不再二次开仓")
+
+        new_stop = position.stop_price
+        current_risk = position.loss_risk_usd()
+        intended_risk = float(position.extras.get("intended_risk_usd") or 0.0)
+        if intended_risk <= 0:
+            risk_pct = self.cfg.trend.risk_pct
+            if position.side is Side.SHORT and position.symbol.upper() == "BTC":
+                risk_pct *= self.cfg.trend.btc_short_risk_mult
+            intended_risk = account.equity * risk_pct * scale
+
+        def _risks(size: float) -> tuple[float, float, float]:
+            new_size = position.size + size
+            avg = (position.entry_price * position.size + signal.entry_price * size) / new_size
+            if position.side is Side.LONG:
+                add_risk = max(0.0, (signal.entry_price - new_stop) * size)
+                combined = max(0.0, (avg - new_stop) * new_size)
+            else:
+                add_risk = max(0.0, (new_stop - signal.entry_price) * size)
+                combined = max(0.0, (new_stop - avg) * new_size)
+            return add_risk, combined, avg
+
+        add_risk, combined_risk, _avg = _risks(add_size)
+        room = intended_risk - current_risk
+        if add_risk > room + 1e-6 and add_risk > 0:
+            add_size *= max(0.0, room) / add_risk
+            if add_size <= 1e-12:
+                return RiskDecision(False, "补仓后将超过原计划满仓风险，拒绝加仓")
+            add_risk, combined_risk, _avg = _risks(add_size)
+
+        if add_size * signal.entry_price < self.cfg.risk.min_notional_usd:
+            return RiskDecision(False, "突破补仓名义价值低于最小下单额")
+
+        others = account.open_risk_usd() - current_risk
+        if others + combined_risk > account.equity * self.cfg.trend.portfolio_risk_max + 1e-9:
+            return RiskDecision(False, "组合潜在止损损失将超过账户 6%")
+
+        sized = PositionSize(
+            notional_usd=add_size * signal.entry_price,
+            size=add_size,
+            leverage=position.leverage,
+            margin_usd=(add_size * signal.entry_price) / max(position.leverage, 1),
+            risk_usd=add_risk,
+            risk_pct=0.0,
+            stop_pct=abs(signal.entry_price - new_stop) / signal.entry_price if signal.entry_price else 0.0,
+        )
+        return RiskDecision(True, "分层补仓风控通过", sized, 0.0, scale)
+
+    def to_tier_add_intent(
+        self,
+        signal: Signal,
+        position: Position,
+        decision: RiskDecision,
+        isolated: bool = True,
+    ) -> OrderIntent | None:
+        if not decision.allowed or decision.size is None:
+            return None
+        add_size = decision.size.size
+        total = position.size + add_size
+        return OrderIntent(
+            action=IntentAction.ADD,
+            symbol=signal.symbol,
+            strategy=StrategyName.TREND,
+            side=signal.side,
+            kind=signal.kind,
+            size=add_size,
+            price=signal.entry_price,
+            stop_price=position.stop_price,
+            leverage=position.leverage,
+            isolated=isolated,
+            reduce_only=False,
+            reason=signal.reason,
+            risk_usd=decision.size.risk_usd,
+            notional_usd=add_size * signal.entry_price,
+            extras={
+                **signal.extras,
+                "tag": signal.tag,
+                "tier": signal.tag or "donchian_close_breakout",
+                "tier_add": True,
+                "breakout_add": True,
+                "pyramid": False,
+                "shared_stop": True,
+                "total_size": total,
+                "add_size": add_size,
+                "sl_oid": position.extras.get("sl_oid"),
+            },
+        )
 
     def evaluate_pyramid(
         self,
@@ -239,6 +360,22 @@ class RiskManager:
         if not decision.allowed or decision.size is None:
             return None
         sz = decision.size
+        extras = {
+            **signal.extras,
+            "tag": signal.tag,
+            "margin_usd": sz.margin_usd,
+            "risk_pct": sz.risk_pct,
+            "stop_pct": sz.stop_pct,
+            "capped_by_max_leverage": sz.capped_by_max_leverage,
+            "leverage_scale": decision.leverage_scale,
+            "tier": signal.extras.get("tier") or signal.tag,
+        }
+        frac = self._trend_open_frac(signal) if signal.strategy is StrategyName.TREND else 1.0
+        if signal.extras.get("starter") and 0.0 < frac < 1.0 and sz.size > 0:
+            extras["intended_full_size"] = sz.size / frac
+            extras["intended_risk_usd"] = sz.risk_usd / frac
+            extras["starter_pending_add"] = True
+            extras["starter_frac"] = frac
         return OrderIntent(
             action=IntentAction.OPEN,
             symbol=signal.symbol,
@@ -254,15 +391,7 @@ class RiskManager:
             reason=signal.reason,
             risk_usd=sz.risk_usd,
             notional_usd=sz.notional_usd,
-            extras={
-                **signal.extras,
-                "tag": signal.tag,
-                "margin_usd": sz.margin_usd,
-                "risk_pct": sz.risk_pct,
-                "stop_pct": sz.stop_pct,
-                "capped_by_max_leverage": sz.capped_by_max_leverage,
-                "leverage_scale": decision.leverage_scale,
-            },
+            extras=extras,
         )
 
 
@@ -286,6 +415,30 @@ def apply_pyramid(account: AccountState, position: Position, add_size: float, ad
     position.extras["pyramid_added_frac"] = max(0.0, (new_size - opened) / opened) if opened else 0.0
     position.remaining_frac = new_size / opened if opened else 1.0
     position.extras["pyramid_count"] = int(position.extras.get("pyramid_count") or 0) + 1
+
+
+def apply_tier_add(account: AccountState, position: Position, add_size: float, add_price: float, new_stop: float) -> None:
+    """合并 Donchian 第二档：加权均价，止损保持共用；完成后的规模视为后续金字塔的首仓。"""
+    if add_size <= 0:
+        return
+    old_size = position.size
+    new_size = old_size + add_size
+    position.entry_price = (position.entry_price * old_size + add_price * add_size) / new_size
+    position.size = new_size
+    position.stop_price = new_stop
+    position.extras["_opened_size"] = new_size
+    position.extras["starter_pending_add"] = False
+    position.extras["starter"] = False
+    position.extras["tier_add_done"] = True
+    position.extras["pyramid_added_frac"] = 0.0
+    position.remaining_frac = 1.0
+    tags = list(position.extras.get("entry_tags") or ([position.tag] if position.tag else []))
+    tags.append("donchian_close_breakout")
+    position.extras["entry_tags"] = tags
+    if position.extras.get("chase"):
+        position.tag = "btc_chase_breakout"
+    else:
+        position.tag = "donchian_close_breakout"
 
 
 def apply_close(account: AccountState, position: Position, exit_price: float, size: float) -> float:

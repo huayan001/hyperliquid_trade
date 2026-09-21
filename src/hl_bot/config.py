@@ -87,6 +87,10 @@ class TrendConfig:
     pyramid_max_frac: float = 0.5
     pyramid_skip_chase: bool = True
     pyramid_be_buffer_atr: float = 0.05
+    # 日线趋势确认后的第一档试探仓（市价）；第二档仍等 4h Donchian 收盘突破补剩余
+    starter_enabled: bool = True
+    starter_frac: float = 0.35
+    starter_symbols: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -233,6 +237,9 @@ def load_config(
             pyramid_max_frac=_as_float(trend_raw.get("pyramid_max_frac"), 0.5),
             pyramid_skip_chase=_as_bool(trend_raw.get("pyramid_skip_chase"), True),
             pyramid_be_buffer_atr=_as_float(trend_raw.get("pyramid_be_buffer_atr"), 0.05),
+            starter_enabled=_as_bool(trend_raw.get("starter_enabled"), True),
+            starter_frac=_as_float(trend_raw.get("starter_frac"), 0.35),
+            starter_symbols=_as_list(trend_raw.get("starter_symbols"), ()),
         ),
         mean_reversion=MeanReversionConfig(
             bb_period=_as_int(mr_raw.get("bb_period"), 20),

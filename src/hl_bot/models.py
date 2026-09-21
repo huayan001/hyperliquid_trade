@@ -244,6 +244,25 @@ class Position:
     def is_chase(self) -> bool:
         return bool(self.extras.get("chase") or self.tag == "btc_chase_breakout")
 
+    def starter_pending(self) -> bool:
+        """趋势第一档 starter 已开、尚未用 Donchian 收盘突破补满计划仓。"""
+        if self.strategy is not StrategyName.TREND:
+            return False
+        if self.extras.get("tier_add_done"):
+            return False
+        if self.extras.get("starter_pending_add"):
+            return True
+        return self.tag == "trend_confirmed_starter"
+
+    def intended_full_size(self) -> float:
+        stored = float(self.extras.get("intended_full_size") or 0.0)
+        if stored > 0:
+            return stored
+        frac = float(self.extras.get("starter_frac") or 0.0)
+        if 0.0 < frac < 1.0:
+            return self.original_size() / frac
+        return self.original_size()
+
 
 @dataclass
 class AccountState:

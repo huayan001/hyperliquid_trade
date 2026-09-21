@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 from hl_bot.models import AccountState, IntentAction, OrderIntent, Position, Side, StrategyName
-from hl_bot.risk import apply_close, apply_fill, apply_pyramid
+from hl_bot.risk import apply_close, apply_fill, apply_pyramid, apply_tier_add
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +40,16 @@ class PaperBroker:
             )
             apply_fill(self.account, pos)
             logger.info(
-                "PAPER 开仓 %s %s size=%.6g @ %.6g stop=%.6g lev=%sx isolated",
+                "PAPER 开仓 %s %s tier=%s tag=%s size=%.6g @ %.6g stop=%.6g lev=%sx isolated  %s",
                 intent.side.value,
                 intent.symbol,
+                intent.extras.get("tier") or "-",
+                intent.extras.get("tag") or pos.tag or "-",
                 intent.size,
                 intent.price,
                 intent.stop_price or 0,
                 intent.leverage,
+                intent.reason,
             )
             return {"status": "paper", "action": "open"}
 
@@ -54,15 +57,33 @@ class PaperBroker:
             pos = self.account.position_for(intent.symbol)
             if pos is None:
                 return {"status": "paper", "action": "missing_position"}
-            apply_pyramid(self.account, pos, intent.size, intent.price, intent.stop_price or pos.stop_price)
-            logger.info(
-                "PAPER 金字塔加仓 %s +%.6g @ %.6g avg=%.6g stop=%.6g",
-                intent.symbol,
-                intent.size,
-                intent.price,
-                pos.entry_price,
-                pos.stop_price,
-            )
+            if intent.extras.get("chase"):
+                pos.extras["chase"] = True
+            if intent.extras.get("tier_add") or intent.extras.get("breakout_add"):
+                apply_tier_add(
+                    self.account, pos, intent.size, intent.price, intent.stop_price or pos.stop_price
+                )
+                logger.info(
+                    "PAPER 分层补仓 %s tier=%s tag=%s +%.6g @ %.6g avg=%.6g stop=%.6g  %s",
+                    intent.symbol,
+                    intent.extras.get("tier") or "-",
+                    intent.extras.get("tag") or "-",
+                    intent.size,
+                    intent.price,
+                    pos.entry_price,
+                    pos.stop_price,
+                    intent.reason,
+                )
+            else:
+                apply_pyramid(self.account, pos, intent.size, intent.price, intent.stop_price or pos.stop_price)
+                logger.info(
+                    "PAPER 金字塔加仓 %s +%.6g @ %.6g avg=%.6g stop=%.6g",
+                    intent.symbol,
+                    intent.size,
+                    intent.price,
+                    pos.entry_price,
+                    pos.stop_price,
+                )
             return {"status": "paper", "action": "add"}
 
         pos = self.account.position_for(intent.symbol)

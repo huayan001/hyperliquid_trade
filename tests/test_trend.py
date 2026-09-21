@@ -1,3 +1,4 @@
+from hl_bot.config import TrendConfig
 from hl_bot.indicators import atr, donchian, last_value
 from hl_bot.models import OrderKind, Regime, Side, StrategyName
 from hl_bot.strategies.trend import TrendStrategy
@@ -64,13 +65,15 @@ def test_eth_large_body_still_maker() -> None:
     assert sig.kind is OrderKind.MAKER_LIMIT
 
 
-def test_no_signal_without_close_confirmation() -> None:
+def test_no_signal_without_close_confirmation_if_starter_disabled() -> None:
     h4 = _breakout_h4(chase=False)
     # 收盘未站上通道
     last = h4[-1]
     h4[-1] = candle(100.1, open_=100.0, high=101.5, low=99.8, ts=last.ts, interval=H4)
     snap = market("BTC", h4=h4)
-    assert TrendStrategy().generate_signal(snap, decision(Regime.TREND_LONG)) is None
+    assert TrendStrategy(TrendConfig(starter_enabled=False)).generate_signal(
+        snap, decision(Regime.TREND_LONG)
+    ) is None
 
 
 def test_short_requires_bearish_regime() -> None:
