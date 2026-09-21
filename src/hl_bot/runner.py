@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from hl_bot.alerts import AlertSink
 from hl_bot.config import BotConfig
-from hl_bot.exchange.client import HyperliquidClient
+from hl_bot.exchange.client import HyperliquidClient, extract_order_fill
 from hl_bot.exchange.paper import PaperBroker
 from hl_bot.models import (
     AccountState,
+    IntentAction,
     MarketSnapshot,
     OrderIntent,
     Regime,
@@ -22,6 +23,7 @@ from hl_bot.models import (
 from hl_bot.funding import (
     funding_against,
     funding_exit_enabled_for,
+    funding_exit_threshold_for,
     make_funding_exit_intent,
     should_exit_on_funding_spike,
 )
@@ -240,7 +242,11 @@ class BotRunner:
         spike, why = should_exit_on_funding_spike(
             pos,
             market.funding,
-            threshold=self.cfg.trend.funding_annual_warn,
+            threshold=funding_exit_threshold_for(
+                pos,
+                self.cfg.trend.funding_annual_exit,
+                self.cfg.mean_reversion.funding_annual_exit,
+            ),
             enabled=enabled,
         )
         if spike:
@@ -253,7 +259,11 @@ class BotRunner:
             if persist_paper or not self.cfg.dry_run:
                 self.broker.submit(intent, now_ms)
             return
-        self.alerts.send(f"{intent.action.value} {intent.symbol} {intent.side.value} {intent.reason}")
+        pos_side = intent.position_side()
+        self.alerts.send(
+            f"{intent.action.value} {intent.symbol} {pos_side.value} "
+            f"({_action_side_label(intent)}) {intent.reason}"
+        )
         if self.cfg.dry_run:
             logger.info("DRY-RUN 意图: %s", _format_intent(intent))
             if persist_paper:
@@ -262,6 +272,7 @@ class BotRunner:
         self.client.connect_sdk(for_trading=True)
         result = self.client.place(intent)
         logger.info("实盘下单返回: %s", result)
+        self._sync_live_fill(intent, result, now_ms)
 
     def run_forever(self) -> None:
         logger.info(
@@ -276,14 +287,35 @@ class BotRunner:
             print(format_report(report), flush=True)
             time.sleep(max(5, self.cfg.poll_seconds))
 
+    def _sync_live_fill(self, intent: OrderIntent, result: object, now_ms: int) -> None:
+        """实盘仅在确认成交后同步本地仓位；place 返回 None / 无 fill 不得假装已平。"""
+        fill = extract_order_fill(result)
+        if fill is None or fill.size <= 0:
+            logger.warning("实盘未确认成交（place=%s），不更新本地仓位", result)
+            return
+        sync_intent = intent.with_size(fill.size)
+        if fill.price:
+            sync_intent = replace(sync_intent, price=fill.price)
+        self.broker.submit(sync_intent, now_ms)
+        # scan --live 默认不 persist_paper，成交后仍要落盘，避免下一轮重复平已空仓
+        self.broker.save()
+
+
+def _action_side_label(intent: OrderIntent) -> str:
+    pos = intent.position_side()
+    if intent.action is IntentAction.OPEN:
+        return "买入开多" if pos is Side.LONG else "卖出开空"
+    if intent.action is IntentAction.ADD:
+        return "金字塔加多" if pos is Side.LONG else "金字塔加空"
+    if intent.action is IntentAction.CLOSE:
+        return "平多" if pos is Side.LONG else "平空"
+    if intent.action is IntentAction.REDUCE:
+        return "减多" if pos is Side.LONG else "减空"
+    return pos.value
+
 
 def _format_intent(intent: OrderIntent) -> str:
-    if intent.action.value == "open":
-        side = "买入开多" if intent.side is Side.LONG else "卖出开空"
-    elif intent.action.value == "add":
-        side = "金字塔加多" if intent.side is Side.LONG else "金字塔加空"
-    else:
-        side = intent.side.value
+    side = _action_side_label(intent)
     return (
         f"{intent.action.value} {side} {intent.size:.6g} {intent.symbol} @ {intent.price:.6g} "
         f"({intent.kind.value}) stop={intent.stop_price} lev={intent.leverage}x "

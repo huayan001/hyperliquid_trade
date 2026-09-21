@@ -58,6 +58,16 @@ def funding_exit_enabled_for(position: Position, trend_enabled: bool, mr_enabled
     return False
 
 
+def funding_exit_threshold_for(
+    position: Position,
+    trend_threshold: float,
+    mr_threshold: float,
+) -> float:
+    if position.strategy is StrategyName.TREND:
+        return trend_threshold
+    return mr_threshold
+
+
 def make_funding_exit_intent(
     position: Position,
     price: float,
