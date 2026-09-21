@@ -12,7 +12,15 @@ from typing import Any
 
 from hl_bot.config import BotConfig
 from hl_bot.exchange.equity import combine_live_equity
-from hl_bot.models import Candle, FundingInfo, MarketSnapshot, OrderIntent, OrderKind, Side
+from hl_bot.models import (
+    Candle,
+    FundingInfo,
+    IntentAction,
+    MarketSnapshot,
+    OrderIntent,
+    OrderKind,
+    Side,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +107,132 @@ def extract_order_fill(result: Any) -> OrderFill | None:
     if filled_sz <= 0:
         return None
     return OrderFill(size=filled_sz, price=(px_num / px_den) if px_den > 0 else None)
+
+
+def collect_error_messages(result: Any) -> list[str]:
+    """收集 SDK /info 下单返回里的 error 文案（含嵌套 order）。"""
+    msgs: list[str] = []
+    if result is None:
+        return msgs
+    if isinstance(result, str):
+        if result.strip():
+            msgs.append(result)
+        return msgs
+    if not isinstance(result, dict):
+        return msgs
+    err = result.get("error")
+    if err:
+        msgs.append(str(err))
+    message = result.get("message")
+    if message:
+        msgs.append(str(message))
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        msgs.extend(collect_error_messages(nested))
+    for item in _collect_statuses(result):
+        if isinstance(item, dict) and item.get("error"):
+            msgs.append(str(item["error"]))
+        elif isinstance(item, str) and item.strip():
+            msgs.append(item)
+    return msgs
+
+
+def is_post_only_reject(result: Any) -> bool:
+    """Alo/post-only 因会立刻吃单被拒。"""
+    for msg in collect_error_messages(result):
+        low = msg.lower()
+        if "post only" in low or "post-only" in low or "alonotallowed" in low:
+            return True
+    return False
+
+
+def extract_resting_oids(result: Any) -> list[int]:
+    """入场单 resting oid；不把同批 stop 的 oid 算进来。"""
+    if result is None or not isinstance(result, dict):
+        return []
+    found: list[int] = []
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        found.extend(extract_resting_oids(nested))
+    for item in _collect_statuses(result):
+        if not isinstance(item, dict):
+            continue
+        resting = item.get("resting")
+        if isinstance(resting, dict) and resting.get("oid") is not None:
+            try:
+                found.append(int(resting["oid"]))
+            except (TypeError, ValueError):
+                continue
+    return _unique_oids(found)
+
+
+def extract_oid(result: Any) -> int | None:
+    oids = extract_oids(result)
+    return oids[0] if oids else None
+
+
+def extract_oids(result: Any) -> list[int]:
+    if result is None or not isinstance(result, dict):
+        return []
+    found: list[int] = []
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        found.extend(extract_oids(nested))
+    for item in _collect_statuses(result):
+        if not isinstance(item, dict):
+            continue
+        for key in ("resting", "filled"):
+            blob = item.get(key)
+            if isinstance(blob, dict) and blob.get("oid") is not None:
+                try:
+                    found.append(int(blob["oid"]))
+                except (TypeError, ValueError):
+                    continue
+        if item.get("oid") is not None:
+            try:
+                found.append(int(item["oid"]))
+            except (TypeError, ValueError):
+                continue
+    return _unique_oids(found)
+
+
+def _unique_oids(oids: list[int]) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for oid in oids:
+        if oid in seen:
+            continue
+        seen.add(oid)
+        out.append(oid)
+    return out
+
+
+def protective_stop_size(intent: OrderIntent, filled_size: float) -> float:
+    """保护止损张数 = 当前仓 + 本笔确认成交，绝不用失败加仓的计划 total_size。"""
+    filled = max(0.0, float(filled_size))
+    current = intent.extras.get("current_size")
+    if current is None:
+        planned = intent.extras.get("total_size")
+        if planned is not None and intent.action is IntentAction.ADD:
+            current = max(0.0, float(planned) - float(intent.size))
+        else:
+            current = 0.0
+    else:
+        current = max(0.0, float(current))
+    return current + filled
+
+
+def is_reduce_only_stop_order(order: dict[str, Any], symbol: str) -> bool:
+    """frontendOpenOrders 里该币的 reduce-only 止损（含 trigger / tpsl=sl）。"""
+    coin = str(order.get("coin") or order.get("symbol") or "")
+    if coin.upper() != symbol.upper():
+        return False
+    reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+    is_trigger = bool(order.get("isTrigger") or order.get("is_trigger"))
+    tpsl = str(order.get("tpsl") or "").lower()
+    otype = str(order.get("orderType") or order.get("origType") or order.get("type") or "").lower()
+    stop_like = is_trigger or tpsl == "sl" or "stop" in otype
+    return reduce_only and stop_like
 
 
 def candle_from_hl(raw: dict[str, Any]) -> Candle:
@@ -332,6 +466,108 @@ class HyperliquidClient:
         factor = 10**dec
         return math_floor(size, factor)
 
+    def fetch_open_orders(self) -> list[dict[str, Any]]:
+        """当前账户挂单（含 trigger 止损）。无地址时返回空列表。"""
+        address = self.cfg.account_address
+        if not address:
+            return []
+        if self._info is not None and hasattr(self._info, "frontend_open_orders"):
+            try:
+                raw = self._info.frontend_open_orders(address)
+                if isinstance(raw, list):
+                    return raw
+            except Exception as exc:
+                logger.debug("SDK frontend_open_orders 失败，改 REST: %s", exc)
+        raw = self._post_info({"type": "frontendOpenOrders", "user": address})
+        return list(raw or [])
+
+    def _limit_tif(self, kind: OrderKind) -> str:
+        return "Alo" if kind is OrderKind.MAKER_LIMIT else "Gtc"
+
+    def _submit_entry(self, intent: OrderIntent, *, is_buy: bool, size: float, tif: str | None = None) -> Any:
+        if intent.kind is OrderKind.MARKET and tif is None:
+            return self._exchange.market_open(intent.symbol, is_buy, size)
+        use_tif = tif or self._limit_tif(intent.kind)
+        return self._exchange.order(
+            intent.symbol,
+            is_buy,
+            size,
+            float(f"{intent.price:.5g}"),
+            {"limit": {"tif": use_tif}},
+            reduce_only=False,
+        )
+
+    def _cancel_oids(self, symbol: str, oids: list[int]) -> list[int]:
+        cancelled: list[int] = []
+        if self._exchange is None:
+            return cancelled
+        for oid in _unique_oids(oids):
+            try:
+                self._exchange.cancel(symbol, int(oid))
+                cancelled.append(int(oid))
+            except Exception as exc:
+                logger.warning("取消 %s 订单 %s 失败: %s", symbol, oid, exc)
+        return cancelled
+
+    def _cancel_resting_entry(self, symbol: str, result: Any) -> list[int]:
+        oids = extract_resting_oids(result)
+        if not oids:
+            return []
+        logger.warning("%s 入场未成交但仍 resting，撤销以免无保护挂单: oids=%s", symbol, oids)
+        return self._cancel_oids(symbol, oids)
+
+    def reduce_only_stop_oids(self, symbol: str, orders: list[dict[str, Any]] | None = None) -> list[int]:
+        rows = orders if orders is not None else self.fetch_open_orders()
+        oids: list[int] = []
+        for item in rows:
+            if not isinstance(item, dict) or not is_reduce_only_stop_order(item, symbol):
+                continue
+            raw_oid = item.get("oid")
+            if raw_oid is None:
+                continue
+            try:
+                oids.append(int(raw_oid))
+            except (TypeError, ValueError):
+                continue
+        return _unique_oids(oids)
+
+    def cancel_reduce_only_stops(self, symbol: str, extra_oids: list[int] | None = None) -> list[int]:
+        """撤掉该币已有 reduce-only 止损，避免重复堆积。查询失败时仍尝试 extras 里的 oid。"""
+        oids = list(extra_oids or [])
+        try:
+            oids.extend(self.reduce_only_stop_oids(symbol))
+        except Exception as exc:
+            logger.warning("查询 %s 挂单失败，仅按已知 oid 撤止损: %s", symbol, exc)
+        if not oids:
+            return []
+        logger.info("%s 替换保护止损前先撤已有 reduce-only 止损: %s", symbol, _unique_oids(oids))
+        return self._cancel_oids(symbol, oids)
+
+    def _place_protective_stop(
+        self,
+        intent: OrderIntent,
+        fill: OrderFill,
+        *,
+        is_buy: bool,
+        sz_decimals: int,
+    ) -> dict[str, Any]:
+        sl_sz = self.round_size(intent.symbol, protective_stop_size(intent, fill.size), sz_decimals)
+        if sl_sz <= 0:
+            return {"status": "skipped", "message": "stop size is 0"}
+        extra: list[int] = []
+        old_oid = intent.extras.get("sl_oid")
+        if old_oid is not None:
+            try:
+                extra.append(int(old_oid))
+            except (TypeError, ValueError):
+                logger.warning("忽略非法 sl_oid=%s", old_oid)
+        self.cancel_reduce_only_stops(intent.symbol, extra_oids=extra)
+        sl_is_buy = not is_buy
+        stop_px = float(f"{intent.stop_price:.5g}")
+        sl_type = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}
+        sl = self._exchange.order(intent.symbol, sl_is_buy, sl_sz, stop_px, sl_type, reduce_only=True)
+        return {"result": sl, "size": sl_sz, "oid": extract_oid(sl)}
+
     def place(self, intent: OrderIntent, *, sz_decimals: int = 4) -> dict[str, Any]:
         if self.cfg.dry_run or self._exchange is None:
             return {"status": "dry_run", "intent": intent.reason}
@@ -344,36 +580,63 @@ class HyperliquidClient:
         if not intent.reduce_only:
             self._exchange.update_leverage(int(intent.leverage), intent.symbol, is_cross=not intent.isolated)
 
-        if intent.kind is OrderKind.MARKET:
-            if intent.reduce_only:
+        if intent.reduce_only:
+            if intent.kind is OrderKind.MARKET:
                 return self._exchange.market_close(intent.symbol, sz=size)
-            return self._exchange.market_open(intent.symbol, is_buy, size)
-        tif = "Alo" if intent.kind is OrderKind.MAKER_LIMIT else "Gtc"
-        result = self._exchange.order(
-            intent.symbol,
-            is_buy,
-            size,
-            float(f"{intent.price:.5g}"),
-            {"limit": {"tif": tif}},
-            reduce_only=intent.reduce_only,
-        )
-        if intent.stop_price and not intent.reduce_only:
-            sl_is_buy = not is_buy
-            stop_px = float(f"{intent.stop_price:.5g}")
-            sl_type = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}
-            old_oid = intent.extras.get("sl_oid")
-            if old_oid is not None:
-                try:
-                    self._exchange.cancel(intent.symbol, int(old_oid))
-                except Exception as exc:  # pragma: no cover
-                    logger.warning("取消旧止损单 %s 失败: %s", old_oid, exc)
-            sl_sz = float(intent.extras.get("total_size") or size)
-            sl_sz = self.round_size(intent.symbol, sl_sz, sz_decimals)
-            sl = self._exchange.order(
-                intent.symbol, sl_is_buy, sl_sz, stop_px, sl_type, reduce_only=True
+            tif = self._limit_tif(intent.kind)
+            return self._exchange.order(
+                intent.symbol,
+                is_buy,
+                size,
+                float(f"{intent.price:.5g}"),
+                {"limit": {"tif": tif}},
+                reduce_only=True,
             )
-            return {"status": "ok", "order": result, "stop": sl}
-        return result
+
+        result = self._submit_entry(intent, is_buy=is_buy, size=size)
+        fill = extract_order_fill(result)
+        retried_gtc = False
+        # 补仓 post-only 被拒：同价再试一次 GTC（会立刻成交的 Alo 本就会吃单）。
+        # 不改 chase_symbols / 不用市价追 ETH：BTC 大实体补仓信号层已是 MARKET。
+        if (
+            fill is None
+            and intent.action is IntentAction.ADD
+            and intent.kind is OrderKind.MAKER_LIMIT
+            and is_post_only_reject(result)
+        ):
+            logger.warning(
+                "%s post-only ADD 被拒（%s），同价再试一次 GTC，而不是市价追价",
+                intent.symbol,
+                "; ".join(collect_error_messages(result)) or result,
+            )
+            retried_gtc = True
+            retry = self._submit_entry(intent, is_buy=is_buy, size=size, tif="Gtc")
+            result = {
+                "status": "ok",
+                "order": retry,
+                "post_only_reject": result,
+                "post_only_retry": "gtc",
+            }
+            fill = extract_order_fill(retry)
+
+        if fill is None or fill.size <= 0:
+            # 市价本意却只 resting，或 GTC 补试未成交：撤掉本轮入场挂单，绝不挂新止损。
+            if intent.kind is OrderKind.MARKET or retried_gtc:
+                self._cancel_resting_entry(intent.symbol, result)
+            logger.warning("入场/加仓未确认成交，不挂本轮保护止损: %s", result)
+            return result
+
+        if not intent.stop_price:
+            return {"status": "ok", "order": result, "stop": None}
+
+        stop_payload = self._place_protective_stop(intent, fill, is_buy=is_buy, sz_decimals=sz_decimals)
+        return {
+            "status": "ok",
+            "order": result,
+            "stop": stop_payload.get("result"),
+            "stop_size": stop_payload.get("size"),
+            "stop_oid": stop_payload.get("oid"),
+        }
 
 
 def math_floor(size: float, factor: int) -> float:
