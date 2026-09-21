@@ -7,6 +7,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 from hl_bot.config import BotConfig
@@ -27,6 +28,76 @@ INTERVAL_MS = {
     "12h": 43_200_000,
     "1d": 86_400_000,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class OrderFill:
+    size: float
+    price: float | None = None
+
+
+def _as_positive_float(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if parsed > 0 else 0.0
+
+
+def _collect_statuses(result: dict[str, Any]) -> list[Any]:
+    statuses: list[Any] = []
+    response = result.get("response")
+    if isinstance(response, dict):
+        data = response.get("data")
+        if isinstance(data, dict) and isinstance(data.get("statuses"), list):
+            statuses.extend(data["statuses"])
+        elif isinstance(data, list):
+            statuses.extend(data)
+    if isinstance(result.get("statuses"), list):
+        statuses.extend(result["statuses"])
+    return statuses
+
+
+def extract_order_fill(result: Any) -> OrderFill | None:
+    """从 Hyperliquid SDK 返回值提取已成交数量。None / 无成交 / 仅 resting / error 视为未成交。"""
+    if result is None or not isinstance(result, dict):
+        return None
+    status = str(result.get("status") or "").lower()
+    if status in {"error", "err", "dry_run"}:
+        return None
+
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        inner = extract_order_fill(nested)
+        if inner is not None:
+            return inner
+
+    filled_sz = 0.0
+    px_num = 0.0
+    px_den = 0.0
+    for item in _collect_statuses(result):
+        if not isinstance(item, dict):
+            continue
+        if item.get("error"):
+            continue
+        filled = item.get("filled")
+        if not isinstance(filled, dict):
+            if "totalSz" in item or "sz" in item:
+                filled = item
+            else:
+                continue
+        sz = _as_positive_float(filled.get("totalSz") or filled.get("sz"))
+        if sz <= 0:
+            continue
+        filled_sz += sz
+        px = _as_positive_float(filled.get("avgPx") or filled.get("px"))
+        if px > 0:
+            px_num += px * sz
+            px_den += sz
+
+    if filled_sz <= 0:
+        return None
+    return OrderFill(size=filled_sz, price=(px_num / px_den) if px_den > 0 else None)
 
 
 def candle_from_hl(raw: dict[str, Any]) -> Candle:

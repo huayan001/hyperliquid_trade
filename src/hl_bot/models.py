@@ -195,6 +195,12 @@ class OrderIntent:
             notional_usd=self.price * size if notional is None else notional,
         )
 
+    def position_side(self) -> Side:
+        """仓位方向。平仓/减仓意图的 side 是订单方向（平多用卖），不能直接当多空标签。"""
+        if self.action in (IntentAction.CLOSE, IntentAction.REDUCE):
+            return self.side.opposite()
+        return self.side
+
 
 @dataclass
 class Position:

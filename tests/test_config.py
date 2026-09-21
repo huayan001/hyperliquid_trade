@@ -1,4 +1,4 @@
-from hl_bot.config import load_config
+from hl_bot.config import BotConfig, load_config
 
 
 def test_default_is_dry_run_without_keys(tmp_path, monkeypatch) -> None:
@@ -23,3 +23,11 @@ def test_live_flag_still_requires_enable_env(monkeypatch) -> None:
         raise AssertionError("should have blocked live")
     except RuntimeError as exc:
         assert "HL_ENABLE_LIVE" in str(exc)
+
+
+def test_funding_exit_defaults_split_by_strategy() -> None:
+    cfg = BotConfig()
+    assert cfg.trend.funding_exit_enabled is False
+    assert cfg.mean_reversion.funding_exit_enabled is True
+    assert cfg.mean_reversion.funding_annual_exit == 0.50
+    assert cfg.trend.funding_annual_exit > cfg.trend.funding_annual_warn

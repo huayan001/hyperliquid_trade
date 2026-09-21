@@ -79,7 +79,9 @@ class TrendConfig:
     weekly_loss_delever: float = 0.10
     funding_annual_warn: float = 0.50
     funding_size_mult: float = 0.5
-    funding_exit_enabled: bool = True
+    # 趋势默认不因资金费飙升自动离场；若手动打开，用独立且更高的离场阈值
+    funding_exit_enabled: bool = False
+    funding_annual_exit: float = 2.0
     pyramid_enabled: bool = True
     pyramid_min_atr: float = 1.0
     pyramid_max_frac: float = 0.5
@@ -108,7 +110,8 @@ class MeanReversionConfig:
     leverage_cap: int = 5
     chase_body_atr: float = 1.5
     bandwidth_high_rank: float = 0.80
-    funding_exit_enabled: bool = False
+    funding_exit_enabled: bool = True
+    funding_annual_exit: float = 0.50
 
 
 @dataclass(slots=True)
@@ -223,7 +226,8 @@ def load_config(
             weekly_loss_delever=_as_float(trend_raw.get("weekly_loss_delever"), 0.10),
             funding_annual_warn=_as_float(trend_raw.get("funding_annual_warn"), 0.50),
             funding_size_mult=_as_float(trend_raw.get("funding_size_mult"), 0.5),
-            funding_exit_enabled=_as_bool(trend_raw.get("funding_exit_enabled"), True),
+            funding_exit_enabled=_as_bool(trend_raw.get("funding_exit_enabled"), False),
+            funding_annual_exit=_as_float(trend_raw.get("funding_annual_exit"), 2.0),
             pyramid_enabled=_as_bool(trend_raw.get("pyramid_enabled"), True),
             pyramid_min_atr=_as_float(trend_raw.get("pyramid_min_atr"), 1.0),
             pyramid_max_frac=_as_float(trend_raw.get("pyramid_max_frac"), 0.5),
@@ -250,7 +254,8 @@ def load_config(
             leverage_cap=_as_int(mr_raw.get("leverage_cap"), 5),
             chase_body_atr=_as_float(mr_raw.get("chase_body_atr"), 1.5),
             bandwidth_high_rank=_as_float(mr_raw.get("bandwidth_high_rank"), 0.80),
-            funding_exit_enabled=_as_bool(mr_raw.get("funding_exit_enabled"), False),
+            funding_exit_enabled=_as_bool(mr_raw.get("funding_exit_enabled"), True),
+            funding_annual_exit=_as_float(mr_raw.get("funding_annual_exit"), 0.50),
         ),
         risk=RiskConfig(
             isolated=_as_bool(risk_raw.get("isolated"), True),
