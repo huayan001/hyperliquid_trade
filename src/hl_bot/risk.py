@@ -260,6 +260,7 @@ class RiskManager:
                 "breakout_add": True,
                 "pyramid": False,
                 "shared_stop": True,
+                "current_size": position.size,
                 "total_size": total,
                 "add_size": add_size,
                 "sl_oid": position.extras.get("sl_oid"),
@@ -351,6 +352,7 @@ class RiskManager:
                 **signal.extras,
                 "tag": signal.tag,
                 "pyramid": True,
+                "current_size": position.size,
                 "total_size": total,
                 "sl_oid": position.extras.get("sl_oid"),
             },
@@ -369,6 +371,7 @@ class RiskManager:
             "capped_by_max_leverage": sz.capped_by_max_leverage,
             "leverage_scale": decision.leverage_scale,
             "tier": signal.extras.get("tier") or signal.tag,
+            "current_size": 0.0,
         }
         frac = self._trend_open_frac(signal) if signal.strategy is StrategyName.TREND else 1.0
         if signal.extras.get("starter") and 0.0 < frac < 1.0 and sz.size > 0:

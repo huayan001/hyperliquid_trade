@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from hl_bot.alerts import AlertSink
 from hl_bot.config import BotConfig
-from hl_bot.exchange.client import HyperliquidClient, extract_order_fill
+from hl_bot.exchange.client import HyperliquidClient, extract_oid, extract_order_fill
 from hl_bot.exchange.paper import PaperBroker
 from hl_bot.models import (
     AccountState,
@@ -318,6 +318,13 @@ class BotRunner:
         if fill.price:
             sync_intent = replace(sync_intent, price=fill.price)
         self.broker.submit(sync_intent, now_ms)
+        if isinstance(result, dict):
+            sl_oid = result.get("stop_oid")
+            if sl_oid is None:
+                sl_oid = extract_oid(result.get("stop"))
+            pos = self.account.position_for(intent.symbol)
+            if pos is not None and sl_oid is not None:
+                pos.extras["sl_oid"] = int(sl_oid)
         # scan --live 默认不 persist_paper，成交后仍要落盘，避免下一轮重复平已空仓
         self.broker.save()
 

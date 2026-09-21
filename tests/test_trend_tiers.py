@@ -129,6 +129,8 @@ def test_breakout_adds_remaining_and_shares_stop() -> None:
     intent = rm.to_tier_add_intent(sig, pos, verdict)
     assert intent is not None
     assert intent.stop_price == old_stop
+    assert abs(float(intent.extras["current_size"]) - 0.35) < 1e-9
+    assert abs(float(intent.extras["total_size"]) - (0.35 + verdict.size.size)) < 1e-9
     assert "第二档" in intent.reason or "donchian_close_breakout" in intent.reason
 
     apply_tier_add(_acct([pos]), pos, verdict.size.size, sig.entry_price, intent.stop_price or old_stop)
