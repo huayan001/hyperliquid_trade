@@ -7,15 +7,31 @@ from datetime import datetime, timezone
 
 from hl_bot.alerts import AlertSink
 from hl_bot.config import BotConfig
-from hl_bot.exchange.client import HyperliquidClient, extract_oid, extract_order_fill
+from hl_bot.exchange.client import (
+    ExchangePosition,
+    HyperliquidClient,
+    extract_oid,
+    extract_order_fill,
+    extract_resting_oids,
+    is_open_entry_order,
+    is_rate_limit_error,
+    normalize_px,
+    order_is_buy,
+    order_limit_px,
+    order_oid,
+    prices_close,
+    same_resting_entry,
+)
 from hl_bot.exchange.paper import PaperBroker
 from hl_bot.models import (
     AccountState,
     IntentAction,
     MarketSnapshot,
     OrderIntent,
+    Position,
     Regime,
     RegimeDecision,
+    RestingEntry,
     Side,
     Signal,
     StrategyName,
@@ -28,7 +44,7 @@ from hl_bot.funding import (
     should_exit_on_funding_spike,
 )
 from hl_bot.regime import route_regime
-from hl_bot.risk import RiskManager
+from hl_bot.risk import RiskManager, apply_fill
 from hl_bot.strategies.mean_reversion import MeanReversionStrategy
 from hl_bot.strategies.trend import TrendStrategy
 
@@ -78,6 +94,9 @@ class BotRunner:
         self.mr = MeanReversionStrategy(cfg.mean_reversion)
         day_key, week_key, _ = _utc_keys()
         self.broker = PaperBroker.load(cfg.state_path, cfg.paper_equity, day_key, week_key)
+        self._open_orders: list[dict] | None = None
+        self._exchange_positions: dict[str, ExchangePosition] = {}
+        self._live_book_ok = True
 
     @property
     def account(self) -> AccountState:
@@ -102,6 +121,8 @@ class BotRunner:
 
         ctxs = self.client.fetch_asset_contexts()
         mids = self.client.fetch_mids()
+        if not self.cfg.dry_run:
+            self.reconcile_live_protection(ctxs)
         reports: list[SymbolReport] = []
         skipped: list[str] = []
         same_way: list[str] = []
@@ -113,6 +134,8 @@ class BotRunner:
             try:
                 market = self.client.load_market(symbol, ctxs.get(symbol), mids.get(symbol))
             except Exception as exc:
+                if is_rate_limit_error(exc):
+                    raise
                 logger.exception("拉取 %s 行情失败", symbol)
                 skipped.append(f"{symbol}: {exc}")
                 continue
@@ -272,11 +295,281 @@ class BotRunner:
             return [make_funding_exit_intent(pos, price, why)]
         return exits
 
+    def reconcile_live_protection(self, ctxs: dict | None = None) -> None:
+        """每轮实盘扫描：resting 随后成交的仓位补上保护止损，并丢掉已不在盘口的挂单记录。"""
+        if self.cfg.dry_run:
+            return
+        self._live_book_ok = False
+        self.client.connect_sdk(for_trading=True)
+        orders = self.client.fetch_open_orders()
+        positions = self.client.fetch_perp_positions()
+        self._open_orders = list(orders)
+        self._exchange_positions = positions
+        self._live_book_ok = True
+        self._cancel_stacked_entries()
+        self._drop_filled_resting(positions)
+        self._align_open_sizes(positions)
+        self._ensure_managed_stops(ctxs or {}, positions)
+        self.broker.save()
+
+    def _exchange_position(self, positions: dict[str, ExchangePosition], symbol: str) -> ExchangePosition | None:
+        if symbol in positions:
+            return positions[symbol]
+        for name, pos in positions.items():
+            if name.upper() == symbol.upper():
+                return pos
+        return None
+
+    def _cancel_stacked_entries(self) -> None:
+        """同一标的、同一方向、同一限价的入场/加仓挂单只留 oid 最小的一张。"""
+        managed = {symbol.upper() for symbol in self.cfg.symbols}
+        groups: dict[tuple[str, bool, float], list[dict]] = {}
+        for order in self._open_orders or []:
+            if not isinstance(order, dict):
+                continue
+            coin = str(order.get("coin") or order.get("symbol") or "")
+            if coin.upper() not in managed:
+                continue
+            if not is_open_entry_order(order, coin):
+                continue
+            buy = order_is_buy(order)
+            px = order_limit_px(order)
+            if buy is None or px <= 0:
+                continue
+            groups.setdefault((coin.upper(), buy, normalize_px(px)), []).append(order)
+        cancelled: set[int] = set()
+        for rows in groups.values():
+            if len(rows) < 2:
+                continue
+            rows.sort(key=lambda row: order_oid(row) or 0)
+            for extra in rows[1:]:
+                oid = order_oid(extra)
+                coin = str(extra.get("coin") or extra.get("symbol") or "")
+                if oid is None or not coin:
+                    continue
+                cancelled.update(self.client._cancel_oids(coin, [oid]))
+        if not cancelled:
+            return
+        logger.info("撤销同价重复入场/加仓挂单: %s", sorted(cancelled))
+        self._open_orders = [row for row in (self._open_orders or []) if order_oid(row) not in cancelled]
+        self.account.resting_entries = [
+            rec for rec in self.account.resting_entries if rec.oid not in cancelled
+        ]
+
+    def _drop_filled_resting(self, positions: dict[str, ExchangePosition]) -> None:
+        open_oids = {oid for oid in (order_oid(row) for row in self._open_orders or []) if oid is not None}
+        kept: list[RestingEntry] = []
+        for rec in self.account.resting_entries:
+            if rec.oid is not None and rec.oid in open_oids:
+                kept.append(rec)
+                continue
+            if rec.oid is None and self._book_has_resting(rec):
+                kept.append(rec)
+                continue
+            ex = self._exchange_position(positions, rec.symbol)
+            if ex is not None and ex.side.value == rec.side:
+                self._adopt_resting_fill(rec, ex)
+        self.account.resting_entries = kept
+
+    def _book_has_resting(self, rec: RestingEntry) -> bool:
+        is_buy = rec.side == Side.LONG.value
+        for order in self._open_orders or []:
+            if same_resting_entry(order, symbol=rec.symbol, is_buy=is_buy, price=rec.price):
+                return True
+        return False
+
+    def _adopt_resting_fill(self, rec: RestingEntry, ex: ExchangePosition) -> None:
+        """resting 单已离开盘口且持仓变大：视为随后成交，补上本地仓位。"""
+        tol = max(1e-8, rec.position_size_at_submit * 0.02, 10 ** -4)
+        if ex.size <= rec.position_size_at_submit + tol:
+            return
+        local = self.account.position_for(rec.symbol)
+        if local is None:
+            if not rec.stop_price or rec.stop_price <= 0:
+                logger.warning("%s resting 已成交但没有策略止损价，不臆造保护单", rec.symbol)
+                return
+            pos = Position(
+                symbol=rec.symbol,
+                strategy=StrategyName(rec.strategy),
+                side=Side(rec.side),
+                size=ex.size,
+                entry_price=ex.entry_price or rec.price,
+                stop_price=rec.stop_price,
+                leverage=rec.leverage,
+                opened_ts=int(time.time() * 1000),
+                tag=rec.tag,
+                extras=dict(rec.extras),
+            )
+            pos.extras.setdefault("_opened_size", ex.size)
+            apply_fill(self.account, pos)
+            logger.info("%s resting %s 已成交，纳入本地仓位 size=%.6g", rec.symbol, rec.action, ex.size)
+            return
+        if local.side is not ex.side:
+            return
+        if ex.size > local.size + max(local.size * 0.02, 1e-8):
+            logger.info(
+                "%s 交易所仓 %.6g 大于本地 %.6g（resting 随后成交），按交易所张数对齐",
+                rec.symbol,
+                ex.size,
+                local.size,
+            )
+            local.size = ex.size
+
+    def _align_open_sizes(self, positions: dict[str, ExchangePosition]) -> None:
+        """本地已在管的仓，张数以交易所为准，避免止损和后续加仓按过期的小仓计算。"""
+        for local in list(self.account.open_positions()):
+            ex = self._exchange_position(positions, local.symbol)
+            if ex is None or ex.side is not local.side:
+                continue
+            tol = max(local.size * 0.02, 1e-6)
+            if ex.size > local.size + tol:
+                logger.info(
+                    "%s 交易所仓 %.6g 大于本地 %.6g，按交易所张数对齐",
+                    local.symbol,
+                    ex.size,
+                    local.size,
+                )
+                local.size = ex.size
+
+    def _ensure_managed_stops(self, ctxs: dict, positions: dict[str, ExchangePosition]) -> None:
+        symbols = list(self.cfg.symbols)
+        for pos in self.account.open_positions():
+            if pos.symbol not in symbols:
+                symbols.append(pos.symbol)
+        for symbol in symbols:
+            try:
+                self._ensure_one_stop(symbol, ctxs, positions)
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    raise
+                logger.exception("对账 %s 保护止损失败", symbol)
+
+    def _ensure_one_stop(self, symbol: str, ctxs: dict, positions: dict[str, ExchangePosition]) -> None:
+        ex = self._exchange_position(positions, symbol)
+        local = self.account.position_for(symbol)
+        if ex is None or ex.size <= 0:
+            return
+        if local is None:
+            logger.warning("%s 交易所有仓 %.6g 但本地无策略仓，不臆造止损价", symbol, ex.size)
+            return
+        if local.side is not ex.side:
+            logger.warning(
+                "%s 本地方向 %s 与交易所 %s 不一致，跳过止损对账",
+                symbol,
+                local.side.value,
+                ex.side.value,
+            )
+            return
+        if not local.stop_price or local.stop_price <= 0:
+            return
+        meta = ctxs.get(symbol) or ctxs.get(symbol.upper()) or {}
+        decimals = int(meta.get("sz_decimals") or 4)
+        outcome = self.client.ensure_protective_stop(
+            symbol,
+            ex.side,
+            ex.size,
+            local.stop_price,
+            sz_decimals=decimals,
+            open_orders=self._open_orders,
+        )
+        oid = outcome.get("oid")
+        if oid is not None:
+            local.extras["sl_oid"] = int(oid)
+
+    def _resting_block_reason(self, intent: OrderIntent) -> str | None:
+        """同标的同档，或交易所已有同向同价的非 reduce-only 挂单，则不再叠一张。"""
+        if intent.action not in (IntentAction.OPEN, IntentAction.ADD) or intent.reduce_only:
+            return None
+        tier = _intent_tier(intent)
+        book = self._open_orders
+        orders = list(book or [])
+        for rec in self.account.resting_entries:
+            if rec.symbol.upper() != intent.symbol.upper():
+                continue
+            if book is None:
+                # 还没读到本轮挂单：本地记录在，就先不要再叠一张
+                if rec.tier == tier or (
+                    rec.side == intent.side.value and prices_close(rec.price, float(intent.price))
+                ):
+                    return f"本地仍记录 resting tier={rec.tier} oid={rec.oid}"
+                continue
+            still_open = rec.oid is None or any(order_oid(row) == rec.oid for row in orders)
+            if not still_open:
+                continue
+            if rec.tier == tier:
+                return f"同档 {tier} oid={rec.oid}"
+            if rec.side == intent.side.value and prices_close(rec.price, float(intent.price)):
+                return f"同价 {intent.price} oid={rec.oid}"
+        is_buy = intent.side is Side.LONG
+        for order in orders:
+            if same_resting_entry(order, symbol=intent.symbol, is_buy=is_buy, price=float(intent.price)):
+                return f"交易所已有同价挂单 oid={order_oid(order)}"
+        return None
+
+    def _remember_resting(self, intent: OrderIntent, result: object) -> None:
+        if intent.action not in (IntentAction.OPEN, IntentAction.ADD) or intent.reduce_only:
+            return
+        oids = _kept_resting_oids(result)
+        if not oids:
+            return
+        local = self.account.position_for(intent.symbol)
+        submitted = float(local.size) if local is not None else 0.0
+        ex = self._exchange_position(self._exchange_positions, intent.symbol)
+        if ex is not None and ex.side is intent.side:
+            submitted = ex.size
+        tier = _intent_tier(intent)
+        rec = RestingEntry(
+            symbol=intent.symbol,
+            tier=tier,
+            action=intent.action.value,
+            side=intent.side.value,
+            price=float(intent.price),
+            size=float(intent.size),
+            stop_price=float(intent.stop_price) if intent.stop_price else None,
+            oid=oids[0],
+            strategy=intent.strategy.value,
+            leverage=int(intent.leverage),
+            isolated=bool(intent.isolated),
+            position_size_at_submit=submitted,
+            tag=str(intent.extras.get("tag") or ""),
+            extras=_json_safe(dict(intent.extras)),
+        )
+        self.account.resting_entries = [
+            item
+            for item in self.account.resting_entries
+            if not (item.symbol.upper() == rec.symbol.upper() and item.tier == rec.tier)
+        ]
+        self.account.resting_entries.append(rec)
+        logger.info(
+            "%s 记录 resting %s tier=%s oid=%s px=%s，后续扫描不重复挂",
+            intent.symbol,
+            intent.action.value,
+            tier,
+            rec.oid,
+            rec.price,
+        )
+
+    def _forget_resting(self, intent: OrderIntent) -> None:
+        tier = _intent_tier(intent)
+        self.account.resting_entries = [
+            item
+            for item in self.account.resting_entries
+            if not (item.symbol.upper() == intent.symbol.upper() and item.tier == tier)
+        ]
+
     def _execute(self, intent: OrderIntent, now_ms: int, *, persist_paper: bool = False) -> None:
         if intent.extras.get("trail_update_only"):
             if persist_paper or not self.cfg.dry_run:
                 self.broker.submit(intent, now_ms)
             return
+        if not self.cfg.dry_run and intent.action in (IntentAction.OPEN, IntentAction.ADD) and not intent.reduce_only:
+            if not self._live_book_ok:
+                logger.warning("%s 本轮未读到挂单，跳过 %s 以免同价堆叠", intent.symbol, intent.action.value)
+                return
+            blocked = self._resting_block_reason(intent)
+            if blocked:
+                logger.info("%s 已有 resting %s，跳过本轮以免堆叠（%s）", intent.symbol, intent.action.value, blocked)
+                return
         pos_side = intent.position_side()
         tag = str(intent.extras.get("tag") or intent.extras.get("tier") or "")
         tier = str(intent.extras.get("tier") or tag)
@@ -303,17 +596,32 @@ class BotRunner:
             ",".join(self.cfg.symbols),
             self.cfg.poll_seconds,
         )
+        backoff = 2.0
         while True:
-            report = self.scan_once(persist_paper=True)
+            try:
+                report = self.scan_once(persist_paper=True)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                if not is_rate_limit_error(exc):
+                    raise
+                logger.warning("本轮扫描遇到 429，%.1fs 后重试，进程不退出: %s", backoff, exc)
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 120.0)
+                continue
             print(format_report(report), flush=True)
+            backoff = 2.0
             time.sleep(max(5, self.cfg.poll_seconds))
 
     def _sync_live_fill(self, intent: OrderIntent, result: object, now_ms: int) -> None:
         """实盘仅在确认成交后同步本地仓位；place 返回 None / 无 fill 不得假装已平。"""
         fill = extract_order_fill(result)
         if fill is None or fill.size <= 0:
+            self._remember_resting(intent, result)
             logger.warning("实盘未确认成交（place=%s），不更新本地仓位", result)
+            self.broker.save()
             return
+        self._forget_resting(intent)
         sync_intent = intent.with_size(fill.size)
         if fill.price:
             sync_intent = replace(sync_intent, price=fill.price)
@@ -327,6 +635,39 @@ class BotRunner:
                 pos.extras["sl_oid"] = int(sl_oid)
         # scan --live 默认不 persist_paper，成交后仍要落盘，避免下一轮重复平已空仓
         self.broker.save()
+
+
+def _intent_tier(intent: OrderIntent) -> str:
+    return str(intent.extras.get("tier") or intent.extras.get("tag") or intent.action.value)
+
+
+def _kept_resting_oids(result: object) -> list[int]:
+    if isinstance(result, dict) and isinstance(result.get("resting_oids"), list):
+        oids: list[int] = []
+        for raw in result["resting_oids"]:
+            try:
+                oids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return oids
+    return extract_resting_oids(result)
+
+
+def _json_safe(value: object) -> dict:
+    if not isinstance(value, dict):
+        return {}
+
+    def _convert(item: object) -> object:
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            return item
+        if isinstance(item, dict):
+            return {str(key): _convert(val) for key, val in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [_convert(val) for val in item]
+        return str(item)
+
+    converted = _convert(value)
+    return converted if isinstance(converted, dict) else {}
 
 
 def _action_side_label(intent: OrderIntent) -> str:
