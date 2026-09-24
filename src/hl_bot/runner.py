@@ -44,7 +44,7 @@ from hl_bot.funding import (
     should_exit_on_funding_spike,
 )
 from hl_bot.regime import route_regime
-from hl_bot.risk import RiskManager, apply_fill
+from hl_bot.risk import RiskManager, apply_fill, clamp_stop_for_leverage
 from hl_bot.strategies.mean_reversion import MeanReversionStrategy
 from hl_bot.strategies.trend import TrendStrategy
 
@@ -96,6 +96,7 @@ class BotRunner:
         self.broker = PaperBroker.load(cfg.state_path, cfg.paper_equity, day_key, week_key)
         self._open_orders: list[dict] | None = None
         self._exchange_positions: dict[str, ExchangePosition] = {}
+        self._asset_ctxs: dict = {}
         self._live_book_ok = True
 
     @property
@@ -120,6 +121,7 @@ class BotRunner:
                 logger.warning("读取实盘权益失败: %s", exc)
 
         ctxs = self.client.fetch_asset_contexts()
+        self._asset_ctxs = ctxs
         mids = self.client.fetch_mids()
         if not self.cfg.dry_run:
             self.reconcile_live_protection(ctxs)
@@ -309,6 +311,8 @@ class BotRunner:
         self._cancel_stacked_entries()
         self._drop_filled_resting(positions)
         self._align_open_sizes(positions)
+        self._align_managed_leverage(positions)
+        self._ensure_stops_before_liq(positions)
         self._ensure_managed_stops(ctxs or {}, positions)
         self.broker.save()
 
@@ -416,10 +420,27 @@ class BotRunner:
             local.size = ex.size
 
     def _align_open_sizes(self, positions: dict[str, ExchangePosition]) -> None:
-        """本地已在管的仓，张数以交易所为准，避免止损和后续加仓按过期的小仓计算。"""
+        """本地已在管的仓与交易所对账：无仓则清幽灵，张数以交易所为准。"""
         for local in list(self.account.open_positions()):
             ex = self._exchange_position(positions, local.symbol)
-            if ex is None or ex.side is not local.side:
+            if ex is None or ex.size <= 0:
+                logger.warning(
+                    "%s 交易所已无仓但本地仍有 %.6g %s，清除幽灵仓（疑似强平/外部平仓） sl_oid=%s",
+                    local.symbol,
+                    local.size,
+                    local.side.value,
+                    local.extras.get("sl_oid"),
+                )
+                self.account.positions = [p for p in self.account.positions if p is not local]
+                continue
+            if ex.side is not local.side:
+                logger.warning(
+                    "%s 本地方向 %s 与交易所 %s 不一致，清除本地幽灵仓",
+                    local.symbol,
+                    local.side.value,
+                    ex.side.value,
+                )
+                self.account.positions = [p for p in self.account.positions if p is not local]
                 continue
             tol = max(local.size * 0.02, 1e-6)
             if ex.size > local.size + tol:
@@ -430,6 +451,133 @@ class BotRunner:
                     local.size,
                 )
                 local.size = ex.size
+
+    def _ensure_margin_for_target_leverage(
+        self,
+        symbol: str,
+        ex: ExchangePosition,
+        target: int,
+        *,
+        force_extra: float = 0.5,
+    ) -> None:
+        """逐仓降杠杆前补足保证金，否则交易所会拒绝 decrease leverage。"""
+        if self.client._exchange is None or not self.cfg.risk.isolated:
+            return
+        entry = float(ex.entry_price or 0.0)
+        if entry <= 0 or ex.size <= 0 or target <= 0:
+            return
+        notional = abs(ex.size) * entry
+        need = notional / float(target)
+        cur = float(ex.margin_used or 0.0)
+        add_amt = need - cur + max(float(force_extra), 0.0)
+        if add_amt <= 0.05:
+            return
+        try:
+            result = self.client._exchange.update_isolated_margin(float(f"{add_amt:.4f}"), symbol)
+            logger.info("%s 为降至 %sx 追加逐仓保证金 $%.4f → %s", symbol, target, add_amt, result)
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                raise
+            logger.warning("%s 追加逐仓保证金失败: %s", symbol, exc)
+
+    def _align_managed_leverage(self, positions: dict[str, ExchangePosition]) -> None:
+        """本地在管仓：交易所杠杆对齐到 target_leverage（默认 10x），保持 isolated/cross 与配置一致。
+
+        若确实改了杠杆，会刷新 positions 映射，以便后续用新的 liquidationPx 判断止损。
+        """
+        if self.cfg.dry_run:
+            return
+        target = max(1, int(self.cfg.risk.target_leverage))
+        isolated = bool(self.cfg.risk.isolated)
+        changed = False
+        for local in list(self.account.open_positions()):
+            ex = self._exchange_position(positions, local.symbol)
+            if ex is None or ex.size <= 0:
+                continue
+            exchange_lev = ex.leverage
+            need = (exchange_lev is None or int(exchange_lev) != target) or int(local.leverage) != target
+            if not need:
+                continue
+            try:
+                self._ensure_margin_for_target_leverage(local.symbol, ex, target)
+                result = self.client.update_leverage(local.symbol, target, isolated=isolated)
+                if isinstance(result, dict) and str(result.get("status", "")).lower() in {"err", "error"}:
+                    msg = str(result.get("response") or result)
+                    if "sufficient margin" in msg.lower() or "decrease leverage" in msg.lower():
+                        self._ensure_margin_for_target_leverage(local.symbol, ex, target, force_extra=1.0)
+                        result = self.client.update_leverage(local.symbol, target, isolated=isolated)
+                    if isinstance(result, dict) and str(result.get("status", "")).lower() in {"err", "error"}:
+                        logger.warning("%s 调整杠杆至 %sx 被拒: %s", local.symbol, target, result)
+                        continue
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    raise
+                logger.warning("%s 调整杠杆至 %sx 失败: %s", local.symbol, target, exc)
+                continue
+            prev = local.leverage
+            local.leverage = target
+            changed = True
+            logger.info(
+                "%s 杠杆已对齐 %sx → %sx（交易所原=%s, isolated=%s）",
+                local.symbol,
+                prev,
+                target,
+                exchange_lev,
+                isolated,
+            )
+        if not changed:
+            return
+        try:
+            refreshed = self.client.fetch_perp_positions()
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                raise
+            logger.warning("改杠杆后刷新持仓失败，止损校验可能仍用旧强平价: %s", exc)
+            return
+        positions.clear()
+        positions.update(refreshed)
+        self._exchange_positions = positions
+
+    def _ensure_stops_before_liq(self, positions: dict[str, ExchangePosition]) -> None:
+        """若策略止损在强平价之外（或超出缓冲），收紧到安全侧，随后由 _ensure_managed_stops 重挂。"""
+        target = max(1, int(self.cfg.risk.target_leverage))
+        buffer_frac = float(self.cfg.risk.liq_buffer_frac)
+        for local in list(self.account.open_positions()):
+            if not local.stop_price or local.stop_price <= 0 or local.entry_price <= 0:
+                continue
+            ex = self._exchange_position(positions, local.symbol)
+            adj, tightened = clamp_stop_for_leverage(
+                side=local.side,
+                entry=local.entry_price,
+                stop=local.stop_price,
+                leverage=target,
+                buffer_frac=buffer_frac,
+            )
+            # 若交易所有明确强平价，再与之交叉校验：多头止损必须 > 强平价
+            if ex is not None and ex.liquidation_px and ex.liquidation_px > 0:
+                liq = float(ex.liquidation_px)
+                if local.side is Side.LONG and adj <= liq:
+                    # 收到强平价上方一小段（0.1% 入场），仍须在入场下方
+                    safe = min(local.entry_price * 0.999, liq * 1.001)
+                    if safe > adj:
+                        adj = safe
+                        tightened = True
+                elif local.side is Side.SHORT and adj >= liq:
+                    safe = max(local.entry_price * 1.001, liq * 0.999)
+                    if safe < adj:
+                        adj = safe
+                        tightened = True
+            if not tightened and abs(adj - local.stop_price) <= 1e-12:
+                continue
+            logger.warning(
+                "%s 策略止损 %.6g 可能晚于强平（liq=%s）；收紧至 %.6g",
+                local.symbol,
+                local.stop_price,
+                getattr(ex, "liquidation_px", None) if ex else None,
+                adj,
+            )
+            local.stop_price = adj
+            local.extras["stop_tightened_for_liq"] = True
 
     def _ensure_managed_stops(self, ctxs: dict, positions: dict[str, ExchangePosition]) -> None:
         symbols = list(self.cfg.symbols)
@@ -475,6 +623,21 @@ class BotRunner:
         oid = outcome.get("oid")
         if oid is not None:
             local.extras["sl_oid"] = int(oid)
+        elif outcome.get("status") == "error" or outcome.get("action") in {
+            "place_failed",
+            "bad_size",
+            "no_exchange",
+        }:
+            logger.warning(
+                "%s 保护止损缺失或重挂失败 action=%s message=%s（本地 stop=%.6g 交易所仓=%.6g）",
+                symbol,
+                outcome.get("action"),
+                outcome.get("message") or outcome,
+                local.stop_price,
+                ex.size,
+            )
+        elif outcome.get("action") not in {"kept", "placed", "skipped"}:
+            logger.warning("%s 保护止损对账异常结果: %s", symbol, outcome)
 
     def _resting_block_reason(self, intent: OrderIntent) -> str | None:
         """同标的同档，或交易所已有同向同价的非 reduce-only 挂单，则不再叠一张。"""
@@ -584,7 +747,9 @@ class BotRunner:
                 self.broker.submit(intent, now_ms)
             return
         self.client.connect_sdk(for_trading=True)
-        result = self.client.place(intent)
+        meta = self._asset_ctxs.get(intent.symbol) or self._asset_ctxs.get(intent.symbol.upper()) or {}
+        decimals = int(meta.get("sz_decimals") or 4)
+        result = self.client.place(intent, sz_decimals=decimals)
         logger.info("实盘下单返回: %s", result)
         self._sync_live_fill(intent, result, now_ms)
 

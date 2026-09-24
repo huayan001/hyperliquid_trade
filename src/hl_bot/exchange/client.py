@@ -268,6 +268,21 @@ class ExchangePosition:
     size: float
     side: Side
     entry_price: float
+    leverage: int | None = None
+    liquidation_px: float | None = None
+    margin_used: float | None = None
+
+
+def _parse_leverage_value(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        raw = raw.get("value")
+    try:
+        lev = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return lev if lev > 0 else None
 
 
 def parse_perp_positions(raw: Any) -> dict[str, ExchangePosition]:
@@ -295,11 +310,22 @@ def parse_perp_positions(raw: Any) -> dict[str, ExchangePosition]:
             entry = float(pos.get("entryPx") or pos.get("entry_price") or 0.0)
         except (TypeError, ValueError):
             entry = 0.0
+        try:
+            liq = float(pos.get("liquidationPx") or pos.get("liquidation_px") or 0.0)
+        except (TypeError, ValueError):
+            liq = 0.0
+        try:
+            margin = float(pos.get("marginUsed") or pos.get("margin_used") or 0.0)
+        except (TypeError, ValueError):
+            margin = 0.0
         out[coin] = ExchangePosition(
             symbol=coin,
             size=abs(szi),
             side=Side.LONG if szi > 0 else Side.SHORT,
             entry_price=entry,
+            leverage=_parse_leverage_value(pos.get("leverage")),
+            liquidation_px=liq if liq > 0 else None,
+            margin_used=margin if margin > 0 else None,
         )
     return out
 
@@ -672,6 +698,19 @@ class HyperliquidClient:
         factor = 10**dec
         return math_floor(size, factor)
 
+    def round_size_cover(self, symbol: str, size: float, sz_decimals: int | None = None) -> float:
+        """保护止损张数：向上取整到 sz 精度，避免 floor 后小于持仓留下裸露。"""
+        dec = sz_decimals if sz_decimals is not None else 4
+        factor = 10**dec
+        return math_ceil(size, factor)
+
+    def update_leverage(self, symbol: str, leverage: int, *, isolated: bool = True) -> Any:
+        """实盘改杠杆；dry-run / 无 exchange 时跳过。"""
+        if self.cfg.dry_run or self._exchange is None:
+            return {"status": "dry_run"}
+        lev = max(1, int(leverage))
+        return self._exchange.update_leverage(lev, symbol, is_cross=not isolated)
+
     def fetch_open_orders(self) -> list[dict[str, Any]]:
         """当前账户挂单（含 trigger 止损）。无地址时返回空列表。"""
         address = self.cfg.account_address
@@ -780,7 +819,7 @@ class HyperliquidClient:
         is_buy: bool,
         sz_decimals: int,
     ) -> dict[str, Any]:
-        sl_sz = self.round_size(intent.symbol, protective_stop_size(intent, fill.size), sz_decimals)
+        sl_sz = self.round_size_cover(intent.symbol, protective_stop_size(intent, fill.size), sz_decimals)
         if sl_sz <= 0:
             return {"status": "skipped", "message": "stop size is 0"}
         extra: list[int] = []
@@ -813,7 +852,7 @@ class HyperliquidClient:
         """
         if self._exchange is None:
             return {"status": "skipped", "action": "no_exchange"}
-        target_sz = self.round_size(symbol, abs(position_size), sz_decimals)
+        target_sz = self.round_size_cover(symbol, abs(position_size), sz_decimals)
         if target_sz <= 0 or stop_price <= 0:
             return {"status": "skipped", "action": "bad_size"}
         target_px = normalize_px(stop_price)
@@ -961,4 +1000,12 @@ class HyperliquidClient:
 
 
 def math_floor(size: float, factor: int) -> float:
-    return int(size * factor) / factor
+    # +1e-9 避免 0.0006*1e4=5.999... 被 floor 成 0.0005（BTC 默认 4 位小数时尤其致命）
+    return int(size * factor + 1e-9) / factor
+
+
+def math_ceil(size: float, factor: int) -> float:
+    # -1e-9 避免刚好落在步进上时被抬到下一档
+    if size <= 0 or factor <= 0:
+        return 0.0
+    return int(size * factor - 1e-9 + 0.999999999) / factor

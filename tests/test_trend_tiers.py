@@ -142,13 +142,14 @@ def test_breakout_adds_remaining_and_shares_stop() -> None:
 
 def test_starter_risk_scaled_by_frac_and_combined_capped() -> None:
     rm = RiskManager(BotConfig())
+    # stop 4%：落在默认 10x×0.5 强平缓冲内，避免 evaluate_open 收紧止损干扰比例断言
     full = Signal(
         symbol="ETH",
         strategy=StrategyName.TREND,
         side=Side.LONG,
         kind=OrderKind.MAKER_LIMIT,
         entry_price=100.0,
-        stop_price=80.0,
+        stop_price=96.0,
         reason="full",
         tag="donchian_close_breakout",
         extras={"size_frac": 1.0},
@@ -172,7 +173,7 @@ def test_starter_risk_scaled_by_frac_and_combined_capped() -> None:
         symbol="ETH",
         size=starter_v.size.size,
         entry=100.0,
-        stop=80.0,
+        stop=96.0,
         intended_full=intent.extras["intended_full_size"],
         intended_risk=intent.extras["intended_risk_usd"],
     )
@@ -182,7 +183,7 @@ def test_starter_risk_scaled_by_frac_and_combined_capped() -> None:
         side=Side.LONG,
         kind=OrderKind.MAKER_LIMIT,
         entry_price=100.0,
-        stop_price=80.0,
+        stop_price=96.0,
         reason="add",
         tag="donchian_close_breakout",
         extras={

@@ -4,8 +4,10 @@
 symbols = ["BTC", "ETH", "SOL", "HYPE"]
 network = "mainnet"          # mainnet | testnet
 dry_run = true
-paper_equity = 10000.0
-poll_seconds = 60
+paper_equity = 477.0
+poll_seconds = 900
+info_request_gap = 0.8   # /info 请求最小间隔秒
+symbol_gap_seconds = 3.0 # 标的之间间隔秒
 state_path = "state/paper_state.json"
 
 [regime]
@@ -32,10 +34,10 @@ trail_step_atr = 1.0
 trail_offset_atr = 0.5
 chase_body_atr = 1.5
 chase_symbols = ["BTC"]
-risk_pct = 0.015             # 1.5%，文档 1%–2%
+risk_pct = 0.02               # 单笔风险 2% 权益
 btc_short_risk_mult = 0.7
-max_positions = 3
-portfolio_risk_max = 0.06
+max_positions = 2
+portfolio_risk_max = 0.04
 daily_loss_delever = 0.05
 weekly_loss_delever = 0.10
 funding_annual_warn = 0.50
@@ -69,11 +71,11 @@ atr_period = 14
 stop_atr = 1.0
 time_stop_hours = 5.0        # 文档 4–6 小时
 partial_tp_frac = 0.5
-risk_pct = 0.0075            # 0.75%，文档 0.5%–1%
-max_positions = 2
-max_trades_per_symbol_day = 4
-daily_loss_halt = 0.03
-leverage_cap = 5
+risk_pct = 0.02               # 单笔风险 2% 权益（与趋势一致）
+max_positions = 1
+max_trades_per_symbol_day = 3
+daily_loss_halt = 0.02
+leverage_cap = 10
 chase_body_atr = 1.5
 bandwidth_high_rank = 0.80   # 近 20 期高位区
 # 震荡/波段：逆向资金费年化 ≥ 本策略自己的阈值时可提前离场（不要复用 trend.funding_annual_warn）
@@ -83,9 +85,11 @@ funding_annual_exit = 0.50
 [risk]
 isolated = true
 min_notional_usd = 10.0
+target_leverage = 10
+liq_buffer_frac = 0.50          # 止损距 ≤ (1/lev)*该系数，避免强平抢先
 
 [risk.max_leverage]
-BTC = 40
-ETH = 25
-SOL = 20
+BTC = 10
+ETH = 10
+SOL = 10
 HYPE = 10

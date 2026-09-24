@@ -1,4 +1,7 @@
-"""仓位与组合风险：杠杆由风险预算 / 止损距离反推，禁止马丁加仓。"""
+"""仓位与组合风险：名义由风险预算/止损距离反推；杠杆固定为目标杠杆（默认 10x）。
+
+禁止马丁加仓。策略止损必须落在交易所强平缓冲之内（止损先于强平）。
+"""
 
 from __future__ import annotations
 
@@ -25,6 +28,44 @@ class RiskDecision:
     size: PositionSize | None = None
     risk_pct_used: float = 0.0
     leverage_scale: float = 1.0
+    # 若为满足强平缓冲而收紧后的止损价；None 表示沿用信号止损
+    adjusted_stop: float | None = None
+
+
+def approx_liq_stop_pct(leverage: int, buffer_frac: float) -> float:
+    """估算「止损相对入场的最大安全距离」：约为 (1/lev)×buffer。
+
+    Hyperliquid 逐仓实测强平距离常明显小于 1/lev（维护保证金等），
+    故 buffer_frac 默认约 0.5，宁可把策略止损收得更近。
+    """
+    lev = max(int(leverage), 1)
+    buf = min(max(float(buffer_frac), 0.05), 0.95)
+    return (1.0 / lev) * buf
+
+
+def clamp_stop_for_leverage(
+    *,
+    side: Side,
+    entry: float,
+    stop: float,
+    leverage: int,
+    buffer_frac: float,
+) -> tuple[float, bool]:
+    """若策略止损超出强平缓冲，将其收到安全侧；返回 (止损价, 是否收紧)。"""
+    if entry <= 0 or stop <= 0:
+        return stop, False
+    max_pct = approx_liq_stop_pct(leverage, buffer_frac)
+    stop_pct = abs(entry - stop) / entry
+    if stop_pct <= max_pct + 1e-12:
+        return stop, False
+    if side is Side.LONG:
+        tightened = entry * (1.0 - max_pct)
+        # 多头止损只能上移（更近），不能比原止损更远
+        new_stop = max(stop, tightened)
+    else:
+        tightened = entry * (1.0 + max_pct)
+        new_stop = min(stop, tightened)
+    return new_stop, abs(new_stop - stop) > 1e-12
 
 
 def derive_position_size(
@@ -36,10 +77,12 @@ def derive_position_size(
     max_leverage: int,
     min_notional: float = 10.0,
     size_mult: float = 1.0,
+    target_leverage: int | None = None,
 ) -> PositionSize | None:
     """
     仓位名义价值 = (账户资金 × 单笔风险比例) / 止损距离百分比
-    实际杠杆 = 名义价值 / 保证金，且不超过标的上限。
+    杠杆：优先使用 target_leverage（默认配置 10x）；再不超过标的/策略上限。
+    名义不超过 equity×杠杆（否则保证金会超过权益）。
     """
     if equity <= 0 or entry <= 0:
         return None
@@ -51,11 +94,26 @@ def derive_position_size(
     if risk_usd <= 0:
         return None
     notional = risk_usd / stop_pct
-    raw_leverage = notional / risk_usd  # == 1 / stop_pct
-    capped = raw_leverage > max_leverage
-    leverage = max(1, min(int(math.ceil(raw_leverage - 1e-9)), max_leverage))
-    if capped:
-        leverage = max_leverage
+
+    cap = max(1, int(max_leverage))
+    if target_leverage is None:
+        # 兼容旧路径：由止损距离反推，再封顶
+        raw_leverage = 1.0 / stop_pct
+        capped = raw_leverage > cap
+        leverage = max(1, min(int(math.ceil(raw_leverage - 1e-9)), cap))
+        if capped:
+            leverage = cap
+    else:
+        want = max(1, int(target_leverage))
+        capped = want > cap
+        leverage = min(want, cap)
+
+    max_notional = equity * leverage
+    if notional > max_notional + 1e-9:
+        notional = max_notional
+        risk_usd = notional * stop_pct
+        capped = True
+
     margin = notional / leverage
     size = notional / entry
     if notional < min_notional:
@@ -66,7 +124,7 @@ def derive_position_size(
         leverage=leverage,
         margin_usd=margin,
         risk_usd=risk_usd,
-        risk_pct=risk_pct * size_mult,
+        risk_pct=(risk_usd / equity) if equity else risk_pct * size_mult,
         stop_pct=stop_pct,
         capped_by_max_leverage=capped,
     )
@@ -86,6 +144,14 @@ class RiskManager:
                 scale *= 0.5
         return scale
 
+    def target_leverage_for(self, symbol: str, strategy: StrategyName, max_leverage_hint: int | None = None) -> int:
+        """开仓使用的目标杠杆：配置 target（默认 10），不超过交易所/标的/策略上限。"""
+        target = max(1, int(self.cfg.risk.target_leverage))
+        cap = max_leverage_hint or self.cfg.max_leverage_for(symbol)
+        if strategy is StrategyName.MEAN_REVERSION:
+            cap = min(cap, self.cfg.mean_reversion.leverage_cap)
+        return max(1, min(target, int(cap)))
+
     def evaluate_open(
         self,
         signal: Signal,
@@ -101,7 +167,7 @@ class RiskManager:
 
         if signal.strategy is StrategyName.MEAN_REVERSION:
             if account.daily_loss_pct() >= self.cfg.mean_reversion.daily_loss_halt:
-                return RiskDecision(False, "均值回归：当日回撤已达 3%，停止新开仓")
+                return RiskDecision(False, "均值回归：当日回撤已达 halt 阈值，停止新开仓")
             day_count = account.day_trades.get(signal.symbol, 0)
             if day_count >= self.cfg.mean_reversion.max_trades_per_symbol_day:
                 return RiskDecision(False, f"{signal.symbol} 当日开仓次数已达上限")
@@ -124,28 +190,48 @@ class RiskManager:
         if signal.strategy is StrategyName.TREND:
             size_mult *= self._trend_open_frac(signal)
 
-        max_lev = max_leverage_hint or self.cfg.max_leverage_for(signal.symbol)
-        if signal.strategy is StrategyName.MEAN_REVERSION:
-            max_lev = min(max_lev, self.cfg.mean_reversion.leverage_cap)
+        leverage = self.target_leverage_for(signal.symbol, signal.strategy, max_leverage_hint)
+        adj_stop, tightened = clamp_stop_for_leverage(
+            side=signal.side,
+            entry=signal.entry_price,
+            stop=signal.stop_price,
+            leverage=leverage,
+            buffer_frac=self.cfg.risk.liq_buffer_frac,
+        )
 
         sized = derive_position_size(
             equity=account.equity,
             risk_pct=risk_pct,
             entry=signal.entry_price,
-            stop=signal.stop_price,
-            max_leverage=max_lev,
+            stop=adj_stop,
+            max_leverage=leverage,
             min_notional=self.cfg.risk.min_notional_usd,
             size_mult=size_mult,
+            target_leverage=leverage,
         )
         if sized is None:
             return RiskDecision(False, "仓位过小或止损距离无效，跳过")
 
         projected_risk = account.open_risk_usd() + sized.risk_usd
         if signal.strategy is StrategyName.TREND:
-            if projected_risk > account.equity * self.cfg.trend.portfolio_risk_max + 1e-9:
-                return RiskDecision(False, "组合潜在止损损失将超过账户 6%")
+            cap_pct = self.cfg.trend.portfolio_risk_max
+            if projected_risk > account.equity * cap_pct + 1e-9:
+                return RiskDecision(
+                    False,
+                    f"组合潜在止损损失将超过账户 {cap_pct:.0%}",
+                )
 
-        return RiskDecision(True, "风控通过", sized, sized.risk_pct, scale)
+        reason = "风控通过"
+        if tightened:
+            reason = f"风控通过（止损已收紧至强平缓冲内 {adj_stop:.6g}）"
+        return RiskDecision(
+            True,
+            reason,
+            sized,
+            sized.risk_pct,
+            scale,
+            adjusted_stop=adj_stop if tightened else None,
+        )
 
     def _trend_open_frac(self, signal: Signal) -> float:
         """starter 按计划满仓的一小部分计风险；整笔突破仍为 1。"""
@@ -212,8 +298,9 @@ class RiskManager:
             return RiskDecision(False, "突破补仓名义价值低于最小下单额")
 
         others = account.open_risk_usd() - current_risk
-        if others + combined_risk > account.equity * self.cfg.trend.portfolio_risk_max + 1e-9:
-            return RiskDecision(False, "组合潜在止损损失将超过账户 6%")
+        cap_pct = self.cfg.trend.portfolio_risk_max
+        if others + combined_risk > account.equity * cap_pct + 1e-9:
+            return RiskDecision(False, f"组合潜在止损损失将超过账户 {cap_pct:.0%}")
 
         sized = PositionSize(
             notional_usd=add_size * signal.entry_price,
@@ -308,8 +395,9 @@ class RiskManager:
         new_total = others + new_risk
         if new_total > old_total + 1e-6:
             return RiskDecision(False, "加仓后组合止损风险将扩大，拒绝金字塔")
-        if new_total > account.equity * self.cfg.trend.portfolio_risk_max + 1e-9:
-            return RiskDecision(False, "组合潜在止损损失将超过账户 6%")
+        cap_pct = self.cfg.trend.portfolio_risk_max
+        if new_total > account.equity * cap_pct + 1e-9:
+            return RiskDecision(False, f"组合潜在止损损失将超过账户 {cap_pct:.0%}")
 
         sized = PositionSize(
             notional_usd=add_size * signal.entry_price,
@@ -362,6 +450,7 @@ class RiskManager:
         if not decision.allowed or decision.size is None:
             return None
         sz = decision.size
+        stop_price = decision.adjusted_stop if decision.adjusted_stop is not None else signal.stop_price
         extras = {
             **signal.extras,
             "tag": signal.tag,
@@ -372,7 +461,11 @@ class RiskManager:
             "leverage_scale": decision.leverage_scale,
             "tier": signal.extras.get("tier") or signal.tag,
             "current_size": 0.0,
+            "target_leverage": sz.leverage,
         }
+        if decision.adjusted_stop is not None:
+            extras["stop_tightened_for_liq"] = True
+            extras["signal_stop_price"] = signal.stop_price
         frac = self._trend_open_frac(signal) if signal.strategy is StrategyName.TREND else 1.0
         if signal.extras.get("starter") and 0.0 < frac < 1.0 and sz.size > 0:
             extras["intended_full_size"] = sz.size / frac
@@ -387,7 +480,7 @@ class RiskManager:
             kind=signal.kind,
             size=sz.size,
             price=signal.entry_price,
-            stop_price=signal.stop_price,
+            stop_price=stop_price,
             leverage=sz.leverage,
             isolated=isolated,
             reduce_only=False,

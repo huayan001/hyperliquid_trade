@@ -71,7 +71,10 @@ cp .env.example .env
 | `HL_NETWORK` | `mainnet` 或 `testnet` |
 | `HL_DRY_RUN` | 默认 `true` |
 | `HL_PAPER_EQUITY` | dry-run / 纸盘模拟权益，默认 `10000`。实盘扫描改读交易所权益，见下节 |
-| `HL_SYMBOLS` | 默认 `BTC,ETH,SOL,HYPE` |
+| `HL_SYMBOLS` | 默认 `BTC,ETH,SOL,HYPE`（实盘小资金常用 `ETH,SOL,HYPE`） |
+| `HL_LEVERAGE` | 统一目标杠杆，默认 `10`（开仓前 `updateLeverage`） |
+| `HL_RISK_PCT` | 单笔风险占权益比例，默认 `0.02`（仓位由止损距离反推） |
+| `HL_LIQ_BUFFER_FRAC` | 止损距 ≤ `(1/杠杆)×该值`，默认 `0.50`，避免强平抢先 |
 | `HL_PRIVATE_KEY` | 仅实盘需要 |
 | `HL_ACCOUNT_ADDRESS` | 使用 API Wallet / Agent 时填**主账户**地址 |
 | `HL_ENABLE_LIVE` | 实盘总闸，必须为 `1` 且命令行加 `--live` |

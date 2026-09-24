@@ -24,7 +24,7 @@ from hl_bot.runner import BotRunner
 STARTER = 0.0157
 FULL = 0.2873
 ADD = 0.1
-STOP = 2500.0
+STOP = 2650.0  # 须落在 10x×0.5 缓冲内，避免 reconcile 收紧止损
 ENTRY = 2727.2
 
 
@@ -301,6 +301,72 @@ def test_second_scan_does_not_stack_same_tier_or_same_price_add(tmp_path) -> Non
     assert len(calls) == 1
 
 
+
+def test_align_clears_ghost_when_exchange_flat(tmp_path) -> None:
+    """交易所已无仓时，本地幽灵仓必须清掉，否则占满趋势配额。"""
+    runner = _runner(tmp_path)
+    runner.account.positions.append(_starter_pos())
+    runner.account.positions.append(
+        Position(
+            symbol="BTC",
+            strategy=StrategyName.TREND,
+            side=Side.LONG,
+            size=0.0006,
+            entry_price=84505.0,
+            stop_price=82535.7,
+            leverage=40,
+            opened_ts=1,
+            tag="trend_confirmed_starter",
+            extras={"_opened_size": 0.0006, "sl_oid": 554280411026, "starter_pending_add": True},
+        )
+    )
+    # 仅 ETH 仍在交易所；BTC 已被强平
+    positions = {
+        "ETH": ExchangePosition(symbol="ETH", size=STARTER, side=Side.LONG, entry_price=2722.7),
+    }
+    runner._align_open_sizes(positions)
+    assert runner.account.position_for("BTC") is None
+    eth = runner.account.position_for("ETH")
+    assert eth is not None
+    assert abs(eth.size - STARTER) < 1e-9
+
+
+def test_align_clears_ghost_on_side_mismatch(tmp_path) -> None:
+    runner = _runner(tmp_path)
+    runner.account.positions.append(_starter_pos())
+    positions = {
+        "ETH": ExchangePosition(symbol="ETH", size=STARTER, side=Side.SHORT, entry_price=2722.7),
+    }
+    runner._align_open_sizes(positions)
+    assert runner.account.position_for("ETH") is None
+
+
+def test_ensure_one_stop_warns_on_place_failed(tmp_path, caplog) -> None:
+    import logging
+
+    runner = _runner(tmp_path)
+    runner.account.positions.append(_starter_pos())
+    positions = {
+        "ETH": ExchangePosition(symbol="ETH", size=STARTER, side=Side.LONG, entry_price=2722.7),
+    }
+
+    def boom(*_a, **_k):
+        return {"status": "error", "action": "place_failed", "message": "simulated"}
+
+    runner.client.ensure_protective_stop = boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING):
+        runner._ensure_one_stop("ETH", {"ETH": {"sz_decimals": 4}}, positions)
+    assert any("保护止损缺失或重挂失败" in r.message for r in caplog.records)
+
+
+def test_math_floor_keeps_btc_six_ten_thousandths() -> None:
+    from hl_bot.exchange.client import math_floor
+
+    # 回归：0.0006 * 1e4 浮点误差不得 floor 成 0.0005
+    assert math_floor(0.0006, 10_000) == 0.0006
+    assert math_floor(0.000601693, 10_000) == 0.0006
+
+
 def test_reconcile_cancels_duplicate_same_price_entries(tmp_path) -> None:
     ex = ScriptedExchange()
     runner = _runner(tmp_path, ex)
@@ -499,3 +565,12 @@ def test_connect_sdk_retries_info_429(monkeypatch) -> None:
     assert calls["n"] == 2
     assert client._sdk_ready is True
     assert client._info == {"url": "https://api.hyperliquid.xyz"}
+
+
+def test_math_ceil_covers_stop_size() -> None:
+    from hl_bot.exchange.client import math_ceil, math_floor
+
+    # floor 会把 0.01421 → 0.0142；cover 对略大的值向上，已对齐的保持不变
+    assert math_floor(0.01421, 10_000) == 0.0142
+    assert math_ceil(0.0142, 10_000) == 0.0142
+    assert math_ceil(0.01420001, 10_000) == 0.0143

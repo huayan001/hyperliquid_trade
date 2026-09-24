@@ -71,7 +71,7 @@ class TrendConfig:
     trail_offset_atr: float = 0.5
     chase_body_atr: float = 1.5
     chase_symbols: tuple[str, ...] = ("BTC",)
-    risk_pct: float = 0.015
+    risk_pct: float = 0.02
     btc_short_risk_mult: float = 0.7
     max_positions: int = 3
     portfolio_risk_max: float = 0.06
@@ -107,11 +107,11 @@ class MeanReversionConfig:
     stop_atr: float = 1.0
     time_stop_hours: float = 5.0
     partial_tp_frac: float = 0.5
-    risk_pct: float = 0.0075
+    risk_pct: float = 0.02
     max_positions: int = 2
     max_trades_per_symbol_day: int = 4
     daily_loss_halt: float = 0.03
-    leverage_cap: int = 5
+    leverage_cap: int = 10
     chase_body_atr: float = 1.5
     bandwidth_high_rank: float = 0.80
     funding_exit_enabled: bool = True
@@ -122,8 +122,12 @@ class MeanReversionConfig:
 class RiskConfig:
     isolated: bool = True
     min_notional_usd: float = 10.0
+    # 所有开仓统一目标杠杆（下单前 updateLeverage）；不超过 max_leverage / 交易所上限
+    target_leverage: int = 10
+    # 策略止损距入场不得超过 (1/lev)*liq_buffer_frac，避免强平抢在止损前
+    liq_buffer_frac: float = 0.50
     max_leverage: dict[str, int] = field(
-        default_factory=lambda: {"BTC": 40, "ETH": 25, "SOL": 20, "HYPE": 10}
+        default_factory=lambda: {"BTC": 10, "ETH": 10, "SOL": 10, "HYPE": 10}
     )
 
 
@@ -222,7 +226,7 @@ def load_config(
             trail_offset_atr=_as_float(trend_raw.get("trail_offset_atr"), 0.5),
             chase_body_atr=_as_float(trend_raw.get("chase_body_atr"), 1.5),
             chase_symbols=_as_list(trend_raw.get("chase_symbols"), ("BTC",)),
-            risk_pct=_as_float(trend_raw.get("risk_pct"), 0.015),
+            risk_pct=_as_float(trend_raw.get("risk_pct"), 0.02),
             btc_short_risk_mult=_as_float(trend_raw.get("btc_short_risk_mult"), 0.7),
             max_positions=_as_int(trend_raw.get("max_positions"), 3),
             portfolio_risk_max=_as_float(trend_raw.get("portfolio_risk_max"), 0.06),
@@ -254,11 +258,11 @@ def load_config(
             stop_atr=_as_float(mr_raw.get("stop_atr"), 1.0),
             time_stop_hours=_as_float(mr_raw.get("time_stop_hours"), 5.0),
             partial_tp_frac=_as_float(mr_raw.get("partial_tp_frac"), 0.5),
-            risk_pct=_as_float(mr_raw.get("risk_pct"), 0.0075),
+            risk_pct=_as_float(mr_raw.get("risk_pct"), 0.02),
             max_positions=_as_int(mr_raw.get("max_positions"), 2),
             max_trades_per_symbol_day=_as_int(mr_raw.get("max_trades_per_symbol_day"), 4),
             daily_loss_halt=_as_float(mr_raw.get("daily_loss_halt"), 0.03),
-            leverage_cap=_as_int(mr_raw.get("leverage_cap"), 5),
+            leverage_cap=_as_int(mr_raw.get("leverage_cap"), 10),
             chase_body_atr=_as_float(mr_raw.get("chase_body_atr"), 1.5),
             bandwidth_high_rank=_as_float(mr_raw.get("bandwidth_high_rank"), 0.80),
             funding_exit_enabled=_as_bool(mr_raw.get("funding_exit_enabled"), True),
@@ -267,9 +271,11 @@ def load_config(
         risk=RiskConfig(
             isolated=_as_bool(risk_raw.get("isolated"), True),
             min_notional_usd=_as_float(risk_raw.get("min_notional_usd"), 10.0),
+            target_leverage=_as_int(risk_raw.get("target_leverage"), 10),
+            liq_buffer_frac=_as_float(risk_raw.get("liq_buffer_frac"), 0.50),
             max_leverage={str(k).upper(): int(v) for k, v in max_lev.items()}
             if max_lev
-            else {"BTC": 40, "ETH": 25, "SOL": 20, "HYPE": 10},
+            else {"BTC": 10, "ETH": 10, "SOL": 10, "HYPE": 10},
         ),
     )
 
@@ -284,6 +290,19 @@ def load_config(
         cfg.enable_live = _as_bool(os.getenv("HL_ENABLE_LIVE"), False)
     if cli_symbols:
         cfg.symbols = _as_list(cli_symbols, cfg.symbols)
+    # 统一杠杆 / 单笔风险%（环境变量优先）
+    if os.getenv("HL_LEVERAGE"):
+        cfg.risk.target_leverage = max(1, _as_int(os.getenv("HL_LEVERAGE"), cfg.risk.target_leverage))
+        # 同步封顶表，避免 hint 仍用旧的 25/40
+        cfg.risk.max_leverage = {sym: cfg.risk.target_leverage for sym in cfg.risk.max_leverage}
+        for sym in ("BTC", "ETH", "SOL", "HYPE"):
+            cfg.risk.max_leverage.setdefault(sym, cfg.risk.target_leverage)
+    if os.getenv("HL_RISK_PCT"):
+        rp = _as_float(os.getenv("HL_RISK_PCT"), cfg.trend.risk_pct)
+        cfg.trend.risk_pct = rp
+        cfg.mean_reversion.risk_pct = rp
+    if os.getenv("HL_LIQ_BUFFER_FRAC"):
+        cfg.risk.liq_buffer_frac = _as_float(os.getenv("HL_LIQ_BUFFER_FRAC"), cfg.risk.liq_buffer_frac)
     if cfg.network not in {"mainnet", "testnet"}:
         raise ValueError(f"未知网络: {cfg.network}")
     return cfg
