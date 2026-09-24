@@ -148,3 +148,62 @@ def test_mr_max_two_positions() -> None:
     rm = RiskManager(BotConfig())
     verdict = rm.evaluate_open(_signal("SOL", strategy=StrategyName.MEAN_REVERSION, entry=100, stop=98), _account(positions=positions))
     assert not verdict.allowed
+
+
+def test_fixed_target_leverage_10x() -> None:
+    """名义仍按风险/止损反推，但杠杆固定为目标 10x，不再随止损距离涨到 50。"""
+    sized = derive_position_size(
+        equity=10_000,
+        risk_pct=0.02,
+        entry=100,
+        stop=94,
+        max_leverage=10,
+        target_leverage=10,
+    )
+    assert sized is not None
+    assert sized.leverage == 10
+    # stop 6% → notional = 200 / 0.06 ≈ 3333.33
+    assert abs(sized.notional_usd - (10_000 * 0.02 / 0.06)) < 1e-6
+    assert abs(sized.risk_usd - 200) < 1e-6
+    assert abs(sized.margin_usd - sized.notional_usd / 10) < 1e-6
+
+
+def test_stop_clamped_inside_liq_buffer() -> None:
+    from hl_bot.risk import clamp_stop_for_leverage
+
+    # 10x × 0.5 buffer → 最大止损距离 5%；策略 8% 应被收紧
+    stop, tightened = clamp_stop_for_leverage(
+        side=Side.LONG, entry=100, stop=92, leverage=10, buffer_frac=0.5
+    )
+    assert tightened
+    assert abs(stop - 95.0) < 1e-9
+
+
+def test_evaluate_open_uses_2pct_and_10x() -> None:
+    cfg = BotConfig()
+    cfg.trend.risk_pct = 0.02
+    cfg.risk.target_leverage = 10
+    cfg.risk.max_leverage = {"ETH": 10, "BTC": 10, "SOL": 10, "HYPE": 10}
+    rm = RiskManager(cfg)
+    verdict = rm.evaluate_open(_signal("ETH", entry=100, stop=97), _account(10_000))
+    assert verdict.allowed and verdict.size
+    assert verdict.size.leverage == 10
+    assert abs(verdict.size.risk_usd - 200) < 1e-6
+
+
+def test_evaluate_open_tightens_wide_stop_before_sizing() -> None:
+    cfg = BotConfig()
+    cfg.trend.risk_pct = 0.02
+    cfg.risk.target_leverage = 10
+    cfg.risk.liq_buffer_frac = 0.5
+    cfg.risk.max_leverage = {"ETH": 10}
+    rm = RiskManager(cfg)
+    # 止损 12% 超出 5% 缓冲 → 收到 5%，名义按收紧后距离计
+    verdict = rm.evaluate_open(_signal("ETH", entry=100, stop=88), _account(10_000))
+    assert verdict.allowed and verdict.size
+    assert verdict.adjusted_stop is not None
+    assert abs(verdict.adjusted_stop - 95.0) < 1e-9
+    intent = rm.to_open_intent(_signal("ETH", entry=100, stop=88), verdict)
+    assert intent is not None
+    assert abs(intent.stop_price - 95.0) < 1e-9
+    assert intent.leverage == 10

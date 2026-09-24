@@ -2,10 +2,14 @@ from hl_bot.config import BotConfig, load_config
 
 
 def test_default_is_dry_run_without_keys(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("HL_PRIVATE_KEY", raising=False)
-    monkeypatch.delenv("HL_ACCOUNT_ADDRESS", raising=False)
-    monkeypatch.delenv("HL_ENABLE_LIVE", raising=False)
-    monkeypatch.delenv("HL_DRY_RUN", raising=False)
+    # 显式覆盖，避免 box 上 live .env 经 load_dotenv 回填
+    monkeypatch.setenv("HL_PRIVATE_KEY", "")
+    monkeypatch.setenv("HL_ACCOUNT_ADDRESS", "")
+    monkeypatch.setenv("HL_ENABLE_LIVE", "0")
+    monkeypatch.setenv("HL_DRY_RUN", "true")
+    monkeypatch.setenv("HL_SYMBOLS", "BTC,ETH,SOL,HYPE")
+    monkeypatch.delenv("HL_LEVERAGE", raising=False)
+    monkeypatch.delenv("HL_RISK_PCT", raising=False)
     cfg = load_config("config.toml")
     assert cfg.dry_run is True
     assert cfg.enable_live is False
@@ -14,7 +18,7 @@ def test_default_is_dry_run_without_keys(tmp_path, monkeypatch) -> None:
 
 
 def test_live_flag_still_requires_enable_env(monkeypatch) -> None:
-    monkeypatch.delenv("HL_ENABLE_LIVE", raising=False)
+    monkeypatch.setenv("HL_ENABLE_LIVE", "0")
     cfg = load_config("config.toml", cli_live=True)
     assert cfg.dry_run is False
     assert cfg.enable_live is False
@@ -38,3 +42,16 @@ def test_trend_starter_defaults_and_toml() -> None:
     assert cfg.trend.starter_enabled is True
     assert abs(cfg.trend.starter_frac - 0.35) < 1e-12
     assert cfg.trend.starter_symbols == ()
+
+
+def test_hl_leverage_and_risk_pct_env(monkeypatch) -> None:
+    monkeypatch.setenv("HL_LEVERAGE", "10")
+    monkeypatch.setenv("HL_RISK_PCT", "0.02")
+    monkeypatch.setenv("HL_SYMBOLS", "ETH,SOL,HYPE")
+    cfg = load_config("config.toml")
+    assert cfg.risk.target_leverage == 10
+    assert cfg.risk.max_leverage["ETH"] == 10
+    assert cfg.risk.max_leverage["BTC"] == 10
+    assert abs(cfg.trend.risk_pct - 0.02) < 1e-12
+    assert abs(cfg.mean_reversion.risk_pct - 0.02) < 1e-12
+    assert cfg.symbols == ("ETH", "SOL", "HYPE")

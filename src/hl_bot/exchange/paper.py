@@ -6,7 +6,15 @@ import json
 import logging
 from pathlib import Path
 
-from hl_bot.models import AccountState, IntentAction, OrderIntent, Position, Side, StrategyName
+from hl_bot.models import (
+    AccountState,
+    IntentAction,
+    OrderIntent,
+    Position,
+    RestingEntry,
+    Side,
+    StrategyName,
+)
 from hl_bot.risk import apply_close, apply_fill, apply_pyramid, apply_tier_add
 
 logger = logging.getLogger(__name__)
@@ -122,6 +130,7 @@ class PaperBroker:
                 }
                 for p in self.account.open_positions()
             ],
+            "resting_entries": [_resting_to_dict(item) for item in self.account.resting_entries],
         }
         self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -173,4 +182,51 @@ class PaperBroker:
                     extras=dict(item.get("extras") or {}),
                 )
             )
+        for item in raw.get("resting_entries") or []:
+            if isinstance(item, dict):
+                account.resting_entries.append(_resting_from_dict(item))
         return cls(account, path)
+
+
+def _resting_to_dict(item: RestingEntry) -> dict:
+    return {
+        "symbol": item.symbol,
+        "tier": item.tier,
+        "action": item.action,
+        "side": item.side,
+        "price": item.price,
+        "size": item.size,
+        "stop_price": item.stop_price,
+        "oid": item.oid,
+        "strategy": item.strategy,
+        "leverage": item.leverage,
+        "isolated": item.isolated,
+        "position_size_at_submit": item.position_size_at_submit,
+        "tag": item.tag,
+        "extras": item.extras,
+    }
+
+
+def _resting_from_dict(item: dict) -> RestingEntry:
+    oid = item.get("oid")
+    try:
+        parsed_oid = int(oid) if oid is not None else None
+    except (TypeError, ValueError):
+        parsed_oid = None
+    stop = item.get("stop_price")
+    return RestingEntry(
+        symbol=str(item.get("symbol") or ""),
+        tier=str(item.get("tier") or ""),
+        action=str(item.get("action") or ""),
+        side=str(item.get("side") or ""),
+        price=float(item.get("price") or 0.0),
+        size=float(item.get("size") or 0.0),
+        stop_price=float(stop) if stop not in (None, "") else None,
+        oid=parsed_oid,
+        strategy=str(item.get("strategy") or ""),
+        leverage=int(item.get("leverage") or 1),
+        isolated=bool(item.get("isolated", True)),
+        position_size_at_submit=float(item.get("position_size_at_submit") or 0.0),
+        tag=str(item.get("tag") or ""),
+        extras=dict(item.get("extras") or {}),
+    )

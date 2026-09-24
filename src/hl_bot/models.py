@@ -265,6 +265,26 @@ class Position:
 
 
 @dataclass
+class RestingEntry:
+    """已挂出但尚未确认成交的入场/加仓。用来避免下一轮同档再挂一张。"""
+
+    symbol: str
+    tier: str
+    action: str
+    side: str
+    price: float
+    size: float
+    stop_price: float | None
+    oid: int | None
+    strategy: str
+    leverage: int
+    isolated: bool
+    position_size_at_submit: float = 0.0
+    tag: str = ""
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class AccountState:
     equity: float
     starting_equity: float
@@ -275,6 +295,7 @@ class AccountState:
     realized_pnl_today: float = 0.0
     day_key: str = ""
     week_key: str = ""
+    resting_entries: list[RestingEntry] = field(default_factory=list)
 
     def open_positions(self) -> list[Position]:
         return [p for p in self.positions if p.size > 0]

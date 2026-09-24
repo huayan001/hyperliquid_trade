@@ -12,7 +12,15 @@ from typing import Any
 
 from hl_bot.config import BotConfig
 from hl_bot.exchange.equity import combine_live_equity
-from hl_bot.models import Candle, FundingInfo, MarketSnapshot, OrderIntent, OrderKind, Side
+from hl_bot.models import (
+    Candle,
+    FundingInfo,
+    IntentAction,
+    MarketSnapshot,
+    OrderIntent,
+    OrderKind,
+    Side,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +109,321 @@ def extract_order_fill(result: Any) -> OrderFill | None:
     return OrderFill(size=filled_sz, price=(px_num / px_den) if px_den > 0 else None)
 
 
+def collect_error_messages(result: Any) -> list[str]:
+    """收集 SDK /info 下单返回里的 error 文案（含嵌套 order）。"""
+    msgs: list[str] = []
+    if result is None:
+        return msgs
+    if isinstance(result, str):
+        if result.strip():
+            msgs.append(result)
+        return msgs
+    if not isinstance(result, dict):
+        return msgs
+    err = result.get("error")
+    if err:
+        msgs.append(str(err))
+    message = result.get("message")
+    if message:
+        msgs.append(str(message))
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        msgs.extend(collect_error_messages(nested))
+    for item in _collect_statuses(result):
+        if isinstance(item, dict) and item.get("error"):
+            msgs.append(str(item["error"]))
+        elif isinstance(item, str) and item.strip():
+            msgs.append(item)
+    return msgs
+
+
+def is_post_only_reject(result: Any) -> bool:
+    """Alo/post-only 因会立刻吃单被拒。"""
+    for msg in collect_error_messages(result):
+        low = msg.lower()
+        if "post only" in low or "post-only" in low or "alonotallowed" in low:
+            return True
+    return False
+
+
+def extract_resting_oids(result: Any) -> list[int]:
+    """入场单 resting oid；不把同批 stop 的 oid 算进来。"""
+    if result is None or not isinstance(result, dict):
+        return []
+    found: list[int] = []
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        found.extend(extract_resting_oids(nested))
+    for item in _collect_statuses(result):
+        if not isinstance(item, dict):
+            continue
+        resting = item.get("resting")
+        if isinstance(resting, dict) and resting.get("oid") is not None:
+            try:
+                found.append(int(resting["oid"]))
+            except (TypeError, ValueError):
+                continue
+    return _unique_oids(found)
+
+
+def extract_oid(result: Any) -> int | None:
+    oids = extract_oids(result)
+    return oids[0] if oids else None
+
+
+def extract_oids(result: Any) -> list[int]:
+    if result is None or not isinstance(result, dict):
+        return []
+    found: list[int] = []
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        found.extend(extract_oids(nested))
+    for item in _collect_statuses(result):
+        if not isinstance(item, dict):
+            continue
+        for key in ("resting", "filled"):
+            blob = item.get(key)
+            if isinstance(blob, dict) and blob.get("oid") is not None:
+                try:
+                    found.append(int(blob["oid"]))
+                except (TypeError, ValueError):
+                    continue
+        if item.get("oid") is not None:
+            try:
+                found.append(int(item["oid"]))
+            except (TypeError, ValueError):
+                continue
+    return _unique_oids(found)
+
+
+def _unique_oids(oids: list[int]) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for oid in oids:
+        if oid in seen:
+            continue
+        seen.add(oid)
+        out.append(oid)
+    return out
+
+
+def protective_stop_size(intent: OrderIntent, filled_size: float) -> float:
+    """保护止损张数 = 当前仓 + 本笔确认成交，绝不用失败加仓的计划 total_size。"""
+    filled = max(0.0, float(filled_size))
+    current = intent.extras.get("current_size")
+    if current is None:
+        planned = intent.extras.get("total_size")
+        if planned is not None and intent.action is IntentAction.ADD:
+            current = max(0.0, float(planned) - float(intent.size))
+        else:
+            current = 0.0
+    else:
+        current = max(0.0, float(current))
+    return current + filled
+
+
+def is_reduce_only_stop_order(order: dict[str, Any], symbol: str) -> bool:
+    """frontendOpenOrders 里该币的 reduce-only 止损（含 trigger / tpsl=sl）。"""
+    coin = str(order.get("coin") or order.get("symbol") or "")
+    if coin.upper() != symbol.upper():
+        return False
+    reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+    is_trigger = bool(order.get("isTrigger") or order.get("is_trigger"))
+    tpsl = str(order.get("tpsl") or "").lower()
+    otype = str(order.get("orderType") or order.get("origType") or order.get("type") or "").lower()
+    stop_like = is_trigger or tpsl == "sl" or "stop" in otype
+    return reduce_only and stop_like
+
+
+class RateLimitError(RuntimeError):
+    """Hyperliquid 429。调用方应退避重试，不得因此退出进程。"""
+
+
+_RATE_LIMIT_ATTEMPTS = 5
+_RATE_LIMIT_BASE_DELAY = 2.0
+_RATE_LIMIT_MAX_DELAY = 60.0
+
+
+def is_rate_limit_error(exc: BaseException | None) -> bool:
+    """识别 HTTP / SDK ClientError 429，含异常链。"""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RateLimitError):
+            return True
+        if getattr(current, "status_code", None) == 429 or getattr(current, "code", None) == 429:
+            return True
+        text = str(current).lstrip()
+        if text.startswith("(429,") or text.startswith("(429 ") or "HTTP 429" in text:
+            return True
+        nxt = current.__cause__ if current.__cause__ is not None else current.__context__
+        current = nxt if nxt is not current else None
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangePosition:
+    symbol: str
+    size: float
+    side: Side
+    entry_price: float
+    leverage: int | None = None
+    liquidation_px: float | None = None
+    margin_used: float | None = None
+
+
+def _parse_leverage_value(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        raw = raw.get("value")
+    try:
+        lev = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return lev if lev > 0 else None
+
+
+def parse_perp_positions(raw: Any) -> dict[str, ExchangePosition]:
+    """clearinghouseState.assetPositions → 绝对张数。szi>0 为多。"""
+    if not isinstance(raw, dict):
+        return {}
+    rows = raw.get("assetPositions")
+    if not isinstance(rows, list):
+        return {}
+    out: dict[str, ExchangePosition] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        pos = item.get("position") if isinstance(item.get("position"), dict) else item
+        if not isinstance(pos, dict):
+            continue
+        coin = str(pos.get("coin") or pos.get("symbol") or "")
+        try:
+            szi = float(pos.get("szi") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not coin or abs(szi) <= 1e-12:
+            continue
+        try:
+            entry = float(pos.get("entryPx") or pos.get("entry_price") or 0.0)
+        except (TypeError, ValueError):
+            entry = 0.0
+        try:
+            liq = float(pos.get("liquidationPx") or pos.get("liquidation_px") or 0.0)
+        except (TypeError, ValueError):
+            liq = 0.0
+        try:
+            margin = float(pos.get("marginUsed") or pos.get("margin_used") or 0.0)
+        except (TypeError, ValueError):
+            margin = 0.0
+        out[coin] = ExchangePosition(
+            symbol=coin,
+            size=abs(szi),
+            side=Side.LONG if szi > 0 else Side.SHORT,
+            entry_price=entry,
+            leverage=_parse_leverage_value(pos.get("leverage")),
+            liquidation_px=liq if liq > 0 else None,
+            margin_used=margin if margin > 0 else None,
+        )
+    return out
+
+
+def normalize_px(px: float) -> float:
+    return float(f"{float(px):.5g}")
+
+
+def prices_close(left: float, right: float) -> bool:
+    if left <= 0 or right <= 0:
+        return False
+    if normalize_px(left) == normalize_px(right):
+        return True
+    return abs(left - right) / max(abs(right), 1e-12) <= 0.001
+
+
+def sizes_close(actual: float, target: float, decimals: int = 4) -> bool:
+    """张数近似相等：一个数量步进，或目标的 2%（取较大者）。"""
+    if target <= 0 or actual <= 0:
+        return False
+    step = 10 ** (-max(int(decimals), 0))
+    tol = max(step, abs(target) * 0.02)
+    return abs(actual - target) <= tol + 1e-9
+
+
+def order_oid(order: dict[str, Any]) -> int | None:
+    raw = order.get("oid")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def order_size(order: dict[str, Any]) -> float:
+    for key in ("sz", "szi", "origSz", "size"):
+        val = _as_positive_float(order.get(key))
+        if val > 0:
+            return val
+    return 0.0
+
+
+def order_trigger_px(order: dict[str, Any]) -> float:
+    for key in ("triggerPx", "trigger_px", "limitPx", "px"):
+        val = _as_positive_float(order.get(key))
+        if val > 0:
+            return val
+    return 0.0
+
+
+def order_limit_px(order: dict[str, Any]) -> float:
+    for key in ("limitPx", "px", "limit_px"):
+        val = _as_positive_float(order.get(key))
+        if val > 0:
+            return val
+    return 0.0
+
+
+def order_is_buy(order: dict[str, Any]) -> bool | None:
+    side = order.get("side")
+    if side is not None:
+        token = str(side).strip().upper()
+        if token in {"B", "BUY", "BID"}:
+            return True
+        if token in {"A", "SELL", "ASK"}:
+            return False
+    if "isBuy" in order:
+        return bool(order.get("isBuy"))
+    if "is_buy" in order:
+        return bool(order.get("is_buy"))
+    return None
+
+
+def is_open_entry_order(order: dict[str, Any], symbol: str) -> bool:
+    """非 reduce-only 的入场/加仓挂单。保护止损不算。"""
+    coin = str(order.get("coin") or order.get("symbol") or "")
+    if coin.upper() != symbol.upper():
+        return False
+    if bool(order.get("reduceOnly") or order.get("reduce_only")):
+        return False
+    if is_reduce_only_stop_order(order, symbol):
+        return False
+    return True
+
+
+def same_resting_entry(order: dict[str, Any], *, symbol: str, is_buy: bool, price: float) -> bool:
+    if not is_open_entry_order(order, symbol):
+        return False
+    buy = order_is_buy(order)
+    if buy is None or buy is not is_buy:
+        return False
+    px = order_limit_px(order)
+    if px <= 0:
+        return False
+    return prices_close(px, price)
+
+
 def candle_from_hl(raw: dict[str, Any]) -> Candle:
     return Candle(
         ts=int(raw["t"]),
@@ -122,25 +445,65 @@ class HyperliquidClient:
         self._sdk_ready = False
 
     def _post_info(self, payload: dict[str, Any]) -> Any:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}/info",
-            data=data,
-            headers={"Content-Type": "application/json", "User-Agent": "hl-bot/0.1"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Hyperliquid /info HTTP {exc.code}: {body}") from exc
+        delay = _RATE_LIMIT_BASE_DELAY
+        last_error: BaseException | None = None
+        for attempt in range(1, _RATE_LIMIT_ATTEMPTS + 1):
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/info",
+                data=data,
+                headers={"Content-Type": "application/json", "User-Agent": "hl-bot/0.1"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                last_error = exc
+                if exc.code == 429 and attempt < _RATE_LIMIT_ATTEMPTS:
+                    logger.warning("/info 429，%.1fs 后重试", delay)
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+                    continue
+                if exc.code == 429:
+                    raise RateLimitError(f"Hyperliquid /info HTTP 429: {body}") from exc
+                raise RuntimeError(f"Hyperliquid /info HTTP {exc.code}: {body}") from exc
+        raise RateLimitError("Hyperliquid /info HTTP 429") from last_error
+
+    def _call_rate_limited(self, fn: Any, *, label: str) -> Any:
+        """SDK Info/Exchange 构造里的 meta 请求也会 429；退避后重试，耗尽则抛 RateLimitError。"""
+        delay = _RATE_LIMIT_BASE_DELAY
+        last_error: BaseException | None = None
+        for attempt in range(1, _RATE_LIMIT_ATTEMPTS + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                if not is_rate_limit_error(exc):
+                    raise
+                last_error = exc
+                if attempt >= _RATE_LIMIT_ATTEMPTS:
+                    break
+                logger.warning("%s 429，%.1fs 后重试", label, delay)
+                time.sleep(delay)
+                delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+        raise RateLimitError(f"{label} 持续 429") from last_error
+
+    def _build_info(self, url: str) -> Any:
+        from hyperliquid.info import Info
+
+        return Info(url, skip_ws=True)
+
+    def _build_exchange(self, url: str, account: Any, address: str) -> Any:
+        from hyperliquid.exchange import Exchange
+
+        return Exchange(account, url, account_address=address)
 
     def connect_sdk(self, *, for_trading: bool = False) -> None:
         if self._sdk_ready and (self._exchange is not None or not for_trading):
             return
         try:
-            from hyperliquid.info import Info
+            from hyperliquid.info import Info  # noqa: F401
             from hyperliquid.utils import constants
         except ImportError as exc:  # pragma: no cover
             if for_trading:
@@ -149,15 +512,18 @@ class HyperliquidClient:
             return
 
         url = constants.TESTNET_API_URL if self.cfg.network == "testnet" else constants.MAINNET_API_URL
-        self._info = Info(url, skip_ws=True)
-        if for_trading:
+        if self._info is None:
+            self._info = self._call_rate_limited(lambda: self._build_info(url), label="Info")
+        if for_trading and self._exchange is None:
             self.cfg.require_live_ready()
             import eth_account
-            from hyperliquid.exchange import Exchange
 
             account = eth_account.Account.from_key(self.cfg.private_key)
             address = self.cfg.account_address or account.address
-            self._exchange = Exchange(account, url, account_address=address)
+            self._exchange = self._call_rate_limited(
+                lambda: self._build_exchange(url, account, address),
+                label="Exchange",
+            )
             logger.info("已连接 Exchange，账户 %s（网络 %s）", address, self.cfg.network)
         self._sdk_ready = True
 
@@ -332,6 +698,227 @@ class HyperliquidClient:
         factor = 10**dec
         return math_floor(size, factor)
 
+    def round_size_cover(self, symbol: str, size: float, sz_decimals: int | None = None) -> float:
+        """保护止损张数：向上取整到 sz 精度，避免 floor 后小于持仓留下裸露。"""
+        dec = sz_decimals if sz_decimals is not None else 4
+        factor = 10**dec
+        return math_ceil(size, factor)
+
+    def update_leverage(self, symbol: str, leverage: int, *, isolated: bool = True) -> Any:
+        """实盘改杠杆；dry-run / 无 exchange 时跳过。"""
+        if self.cfg.dry_run or self._exchange is None:
+            return {"status": "dry_run"}
+        lev = max(1, int(leverage))
+        return self._exchange.update_leverage(lev, symbol, is_cross=not isolated)
+
+    def fetch_open_orders(self) -> list[dict[str, Any]]:
+        """当前账户挂单（含 trigger 止损）。无地址时返回空列表。"""
+        address = self.cfg.account_address
+        if not address:
+            return []
+        if self._info is not None and hasattr(self._info, "frontend_open_orders"):
+            try:
+                raw = self._info.frontend_open_orders(address)
+                if isinstance(raw, list):
+                    return raw
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    logger.warning("SDK frontend_open_orders 429，改 REST /info: %s", exc)
+                else:
+                    logger.debug("SDK frontend_open_orders 失败，改 REST: %s", exc)
+        raw = self._post_info({"type": "frontendOpenOrders", "user": address})
+        return list(raw or [])
+
+    def fetch_perp_positions(self) -> dict[str, ExchangePosition]:
+        """永续持仓。无地址时返回空。429 向上抛，由扫描循环退避。"""
+        address = self.cfg.account_address
+        if not address:
+            return {}
+        if self._info is not None and hasattr(self._info, "user_state"):
+            try:
+                raw = self._info.user_state(address)
+                if isinstance(raw, dict):
+                    return parse_perp_positions(raw)
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    logger.warning("SDK user_state 429，改 REST /info: %s", exc)
+                else:
+                    logger.debug("SDK user_state 失败，改 REST: %s", exc)
+        raw = self._post_info({"type": "clearinghouseState", "user": address})
+        return parse_perp_positions(raw)
+
+    def _limit_tif(self, kind: OrderKind) -> str:
+        return "Alo" if kind is OrderKind.MAKER_LIMIT else "Gtc"
+
+    def _submit_entry(self, intent: OrderIntent, *, is_buy: bool, size: float, tif: str | None = None) -> Any:
+        if intent.kind is OrderKind.MARKET and tif is None:
+            return self._exchange.market_open(intent.symbol, is_buy, size)
+        use_tif = tif or self._limit_tif(intent.kind)
+        return self._exchange.order(
+            intent.symbol,
+            is_buy,
+            size,
+            float(f"{intent.price:.5g}"),
+            {"limit": {"tif": use_tif}},
+            reduce_only=False,
+        )
+
+    def _cancel_oids(self, symbol: str, oids: list[int]) -> list[int]:
+        cancelled: list[int] = []
+        if self._exchange is None:
+            return cancelled
+        for oid in _unique_oids(oids):
+            try:
+                self._exchange.cancel(symbol, int(oid))
+                cancelled.append(int(oid))
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    raise
+                logger.warning("取消 %s 订单 %s 失败: %s", symbol, oid, exc)
+        return cancelled
+
+    def _cancel_resting_entry(self, symbol: str, result: Any) -> list[int]:
+        oids = extract_resting_oids(result)
+        if not oids:
+            return []
+        logger.warning("%s 入场未成交但仍 resting，撤销以免无保护挂单: oids=%s", symbol, oids)
+        return self._cancel_oids(symbol, oids)
+
+    def reduce_only_stop_oids(self, symbol: str, orders: list[dict[str, Any]] | None = None) -> list[int]:
+        rows = orders if orders is not None else self.fetch_open_orders()
+        oids: list[int] = []
+        for item in rows:
+            if not isinstance(item, dict) or not is_reduce_only_stop_order(item, symbol):
+                continue
+            raw_oid = item.get("oid")
+            if raw_oid is None:
+                continue
+            try:
+                oids.append(int(raw_oid))
+            except (TypeError, ValueError):
+                continue
+        return _unique_oids(oids)
+
+    def cancel_reduce_only_stops(self, symbol: str, extra_oids: list[int] | None = None) -> list[int]:
+        """撤掉该币已有 reduce-only 止损，避免重复堆积。查询失败时仍尝试 extras 里的 oid。"""
+        oids = list(extra_oids or [])
+        try:
+            oids.extend(self.reduce_only_stop_oids(symbol))
+        except Exception as exc:
+            logger.warning("查询 %s 挂单失败，仅按已知 oid 撤止损: %s", symbol, exc)
+        if not oids:
+            return []
+        logger.info("%s 替换保护止损前先撤已有 reduce-only 止损: %s", symbol, _unique_oids(oids))
+        return self._cancel_oids(symbol, oids)
+
+    def _place_protective_stop(
+        self,
+        intent: OrderIntent,
+        fill: OrderFill,
+        *,
+        is_buy: bool,
+        sz_decimals: int,
+    ) -> dict[str, Any]:
+        sl_sz = self.round_size_cover(intent.symbol, protective_stop_size(intent, fill.size), sz_decimals)
+        if sl_sz <= 0:
+            return {"status": "skipped", "message": "stop size is 0"}
+        extra: list[int] = []
+        old_oid = intent.extras.get("sl_oid")
+        if old_oid is not None:
+            try:
+                extra.append(int(old_oid))
+            except (TypeError, ValueError):
+                logger.warning("忽略非法 sl_oid=%s", old_oid)
+        self.cancel_reduce_only_stops(intent.symbol, extra_oids=extra)
+        sl_is_buy = not is_buy
+        stop_px = float(f"{intent.stop_price:.5g}")
+        sl_type = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}
+        sl = self._exchange.order(intent.symbol, sl_is_buy, sl_sz, stop_px, sl_type, reduce_only=True)
+        return {"result": sl, "size": sl_sz, "oid": extract_oid(sl)}
+
+    def ensure_protective_stop(
+        self,
+        symbol: str,
+        side: Side,
+        position_size: float,
+        stop_price: float,
+        *,
+        sz_decimals: int = 4,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """保证该币恰好一张 reduce-only 保护止损，张数≈持仓，触发价≈策略止损。
+
+        已有一张匹配的就留下，只撤重复或不匹配的；一张都没有或张数/价格不对则撤掉再挂。
+        """
+        if self._exchange is None:
+            return {"status": "skipped", "action": "no_exchange"}
+        target_sz = self.round_size_cover(symbol, abs(position_size), sz_decimals)
+        if target_sz <= 0 or stop_price <= 0:
+            return {"status": "skipped", "action": "bad_size"}
+        target_px = normalize_px(stop_price)
+        want_buy = side is Side.SHORT
+        rows = list(open_orders if open_orders is not None else self.fetch_open_orders())
+        stops = [row for row in rows if isinstance(row, dict) and is_reduce_only_stop_order(row, symbol)]
+
+        def _matches(order: dict[str, Any]) -> bool:
+            buy = order_is_buy(order)
+            if buy is not None and buy is not want_buy:
+                return False
+            return sizes_close(order_size(order), target_sz, sz_decimals) and prices_close(
+                order_trigger_px(order), target_px
+            )
+
+        matching = [row for row in stops if _matches(row)]
+        match_ids = {id(row) for row in matching}
+        extras = [row for row in stops if id(row) not in match_ids]
+        if matching:
+            keep = matching[0]
+            cancel_ids = [oid for row in matching[1:] + extras if (oid := order_oid(row)) is not None]
+            cancelled = self._cancel_oids(symbol, cancel_ids) if cancel_ids else []
+            kept_oid = order_oid(keep)
+            if cancelled:
+                logger.info("%s 保留匹配保护止损 oid=%s，撤销重复 %s", symbol, kept_oid, cancelled)
+            return {
+                "status": "ok",
+                "action": "kept",
+                "oid": kept_oid,
+                "size": target_sz,
+                "cancelled": cancelled,
+            }
+
+        cancel_ids = [oid for row in stops if (oid := order_oid(row)) is not None]
+        cancelled = self._cancel_oids(symbol, cancel_ids) if cancel_ids else []
+        sl_type = {"trigger": {"triggerPx": target_px, "isMarket": True, "tpsl": "sl"}}
+        try:
+            sl = self._exchange.order(symbol, want_buy, target_sz, target_px, sl_type, reduce_only=True)
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                raise
+            logger.warning("挂 %s 保护止损失败: %s", symbol, exc)
+            return {
+                "status": "error",
+                "action": "place_failed",
+                "cancelled": cancelled,
+                "message": str(exc),
+            }
+        oid = extract_oid(sl)
+        logger.info(
+            "%s 保护止损已对齐 size=%.6g stop=%s oid=%s cancelled=%s",
+            symbol,
+            target_sz,
+            target_px,
+            oid,
+            cancelled,
+        )
+        return {
+            "status": "ok",
+            "action": "placed",
+            "oid": oid,
+            "size": target_sz,
+            "cancelled": cancelled,
+            "result": sl,
+        }
+
     def place(self, intent: OrderIntent, *, sz_decimals: int = 4) -> dict[str, Any]:
         if self.cfg.dry_run or self._exchange is None:
             return {"status": "dry_run", "intent": intent.reason}
@@ -344,37 +931,81 @@ class HyperliquidClient:
         if not intent.reduce_only:
             self._exchange.update_leverage(int(intent.leverage), intent.symbol, is_cross=not intent.isolated)
 
-        if intent.kind is OrderKind.MARKET:
-            if intent.reduce_only:
+        if intent.reduce_only:
+            if intent.kind is OrderKind.MARKET:
                 return self._exchange.market_close(intent.symbol, sz=size)
-            return self._exchange.market_open(intent.symbol, is_buy, size)
-        tif = "Alo" if intent.kind is OrderKind.MAKER_LIMIT else "Gtc"
-        result = self._exchange.order(
-            intent.symbol,
-            is_buy,
-            size,
-            float(f"{intent.price:.5g}"),
-            {"limit": {"tif": tif}},
-            reduce_only=intent.reduce_only,
-        )
-        if intent.stop_price and not intent.reduce_only:
-            sl_is_buy = not is_buy
-            stop_px = float(f"{intent.stop_price:.5g}")
-            sl_type = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}
-            old_oid = intent.extras.get("sl_oid")
-            if old_oid is not None:
-                try:
-                    self._exchange.cancel(intent.symbol, int(old_oid))
-                except Exception as exc:  # pragma: no cover
-                    logger.warning("取消旧止损单 %s 失败: %s", old_oid, exc)
-            sl_sz = float(intent.extras.get("total_size") or size)
-            sl_sz = self.round_size(intent.symbol, sl_sz, sz_decimals)
-            sl = self._exchange.order(
-                intent.symbol, sl_is_buy, sl_sz, stop_px, sl_type, reduce_only=True
+            tif = self._limit_tif(intent.kind)
+            return self._exchange.order(
+                intent.symbol,
+                is_buy,
+                size,
+                float(f"{intent.price:.5g}"),
+                {"limit": {"tif": tif}},
+                reduce_only=True,
             )
-            return {"status": "ok", "order": result, "stop": sl}
-        return result
+
+        result = self._submit_entry(intent, is_buy=is_buy, size=size)
+        fill = extract_order_fill(result)
+        retried_gtc = False
+        # 补仓 post-only 被拒：同价再试一次 GTC（会立刻成交的 Alo 本就会吃单）。
+        # 不改 chase_symbols / 不用市价追 ETH：BTC 大实体补仓信号层已是 MARKET。
+        if (
+            fill is None
+            and intent.action is IntentAction.ADD
+            and intent.kind is OrderKind.MAKER_LIMIT
+            and is_post_only_reject(result)
+        ):
+            logger.warning(
+                "%s post-only ADD 被拒（%s），同价再试一次 GTC，而不是市价追价",
+                intent.symbol,
+                "; ".join(collect_error_messages(result)) or result,
+            )
+            retried_gtc = True
+            retry = self._submit_entry(intent, is_buy=is_buy, size=size, tif="Gtc")
+            result = {
+                "status": "ok",
+                "order": retry,
+                "post_only_reject": result,
+                "post_only_retry": "gtc",
+            }
+            fill = extract_order_fill(retry)
+
+        if fill is None or fill.size <= 0:
+            # 市价本意却只 resting，或 GTC 补试未成交：撤掉本轮入场挂单，绝不挂新止损。
+            # Maker 限价继续留在盘口，等后续扫描对账成交后再补保护止损，避免同价重复挂。
+            cancelled: list[int] = []
+            if intent.kind is OrderKind.MARKET or retried_gtc:
+                cancelled = self._cancel_resting_entry(intent.symbol, result)
+            kept = [oid for oid in extract_resting_oids(result) if oid not in set(cancelled)]
+            logger.warning("入场/加仓未确认成交，不挂本轮保护止损: %s", result)
+            if not isinstance(result, dict):
+                result = {"status": "ok", "order": result}
+            else:
+                result = dict(result)
+            result["entry_unfilled"] = True
+            result["resting_oids"] = kept
+            return result
+
+        if not intent.stop_price:
+            return {"status": "ok", "order": result, "stop": None}
+
+        stop_payload = self._place_protective_stop(intent, fill, is_buy=is_buy, sz_decimals=sz_decimals)
+        return {
+            "status": "ok",
+            "order": result,
+            "stop": stop_payload.get("result"),
+            "stop_size": stop_payload.get("size"),
+            "stop_oid": stop_payload.get("oid"),
+        }
 
 
 def math_floor(size: float, factor: int) -> float:
-    return int(size * factor) / factor
+    # +1e-9 避免 0.0006*1e4=5.999... 被 floor 成 0.0005（BTC 默认 4 位小数时尤其致命）
+    return int(size * factor + 1e-9) / factor
+
+
+def math_ceil(size: float, factor: int) -> float:
+    # -1e-9 避免刚好落在步进上时被抬到下一档
+    if size <= 0 or factor <= 0:
+        return 0.0
+    return int(size * factor - 1e-9 + 0.999999999) / factor
