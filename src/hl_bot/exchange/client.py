@@ -8,10 +8,18 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from hl_bot.config import BotConfig
+from hl_bot.exchange.candle_cache import OVERLAP_BARS, CandleCache, merge_closed
 from hl_bot.exchange.equity import combine_live_equity
+from hl_bot.exchange.throttle import (
+    RequestThrottle,
+    ScanBudget,
+    exchange_weight_from_payload,
+    info_weight,
+)
 from hl_bot.models import (
     Candle,
     FundingInfo,
@@ -449,6 +457,24 @@ def candle_from_hl(raw: dict[str, Any]) -> Candle:
     )
 
 
+def _message_is_rate_limit(message: str) -> bool:
+    text = str(message or "")
+    if is_rate_limit_error(RuntimeError(text)):
+        return True
+    low = text.lower()
+    return "429" in text or "rate limit" in low or "too many requests" in low
+
+
+@dataclass(slots=True)
+class AccountSnapshot:
+    """一轮扫描里共享的账户读数。perps_raw 同时给权益和持仓用，避免再打一次 clearinghouseState。"""
+
+    perps_raw: Any = None
+    spot_raw: Any = None
+    perps_error: str | None = None
+    spot_error: str | None = None
+
+
 class HyperliquidClient:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
@@ -458,11 +484,44 @@ class HyperliquidClient:
         self.last_abstraction: str | None = None
         self._exchange = None
         self._sdk_ready = False
+        self._perp_meta: Any = None
+        self._spot_meta: Any = None
+        # sleep 走本模块的 time.sleep，测试里打补丁时节流也会跟着停住
+        self.throttle = RequestThrottle(sleep=lambda seconds: time.sleep(seconds))
+        self.budget = ScanBudget()
+        self.candle_cache = CandleCache(Path(cfg.state_path).parent / "candles")
+        self._share_book = False
+        self.shared_perps_raw: Any = None
+        self.shared_open_orders: list[dict[str, Any]] | None = None
+        self._perps_rate_limited = False
+        self._perps_rate_limit_message = ""
+
+    def begin_scan(self) -> None:
+        """一轮扫描开始：清空共享快照，并重置请求计数。"""
+        self._share_book = True
+        self.shared_perps_raw = None
+        self.shared_open_orders = None
+        self._perps_rate_limited = False
+        self._perps_rate_limit_message = ""
+        self.budget.begin()
+
+    def end_scan(self) -> None:
+        try:
+            self.budget.log()
+        finally:
+            self._share_book = False
+            self.shared_perps_raw = None
+            self.shared_open_orders = None
+            self._perps_rate_limited = False
+            self._perps_rate_limit_message = ""
 
     def _post_info(self, payload: dict[str, Any]) -> Any:
         delay = _RATE_LIMIT_BASE_DELAY
         last_error: BaseException | None = None
+        name = str(payload.get("type") or "info")
         for attempt in range(1, _RATE_LIMIT_ATTEMPTS + 1):
+            estimate = info_weight(payload)
+            self.throttle.acquire_info(estimate)
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
                 f"{self.base_url}/info",
@@ -472,18 +531,23 @@ class HyperliquidClient:
             )
             try:
                 with urllib.request.urlopen(req, timeout=20) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                    raw = json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
                 last_error = exc
-                if exc.code == 429 and attempt < _RATE_LIMIT_ATTEMPTS:
-                    logger.warning("/info 429，%.1fs 后重试", delay)
-                    time.sleep(delay)
-                    delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
-                    continue
                 if exc.code == 429:
+                    self.budget.record(name, estimate, rate_limited=True)
+                    if attempt < _RATE_LIMIT_ATTEMPTS:
+                        logger.warning("/info 429，%.1fs 后重试", delay)
+                        time.sleep(delay)
+                        delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+                        continue
                     raise RateLimitError(f"Hyperliquid /info HTTP 429: {body}") from exc
                 raise RuntimeError(f"Hyperliquid /info HTTP {exc.code}: {body}") from exc
+            actual = info_weight(payload, raw)
+            self.throttle.adjust_info(actual - estimate)
+            self.budget.record(name, actual)
+            return raw
         raise RateLimitError("Hyperliquid /info HTTP 429") from last_error
 
     def _call_rate_limited(self, fn: Any, *, label: str) -> Any:
@@ -507,12 +571,75 @@ class HyperliquidClient:
     def _build_info(self, url: str) -> Any:
         from hyperliquid.info import Info
 
-        return Info(url, skip_ws=True)
+        # 先走已节流的 REST，把 meta 传进 SDK，避免构造函数里再打两轮未计数的 /info
+        meta = self._post_info({"type": "meta"})
+        spot_meta = self._post_info({"type": "spotMeta"})
+        self._perp_meta = meta
+        self._spot_meta = spot_meta
+        info = Info(url, skip_ws=True, meta=meta, spot_meta=spot_meta)
+        self._install_info_throttle(info)
+        return info
 
     def _build_exchange(self, url: str, account: Any, address: str) -> Any:
         from hyperliquid.exchange import Exchange
 
-        return Exchange(account, url, account_address=address)
+        exchange = Exchange(
+            account,
+            url,
+            meta=self._perp_meta,
+            account_address=address,
+            spot_meta=self._spot_meta,
+        )
+        self._install_info_throttle(exchange.info)
+        self._install_exchange_throttle(exchange)
+        return exchange
+
+    def _install_info_throttle(self, info: Any) -> None:
+        if getattr(info, "_hl_info_throttled", False):
+            return
+        original = info.post
+
+        def wrapped(url_path: str, payload: Any = None) -> Any:
+            if not str(url_path).endswith("/info") or not isinstance(payload, dict):
+                return original(url_path, payload)
+            name = str(payload.get("type") or "info")
+            estimate = info_weight(payload)
+            self.throttle.acquire_info(estimate)
+            try:
+                raw = original(url_path, payload)
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    self.budget.record(name, estimate, rate_limited=True)
+                raise
+            actual = info_weight(payload, raw)
+            self.throttle.adjust_info(actual - estimate)
+            self.budget.record(name, actual)
+            return raw
+
+        info.post = wrapped
+        info._hl_info_throttled = True
+
+    def _install_exchange_throttle(self, exchange: Any) -> None:
+        if getattr(exchange, "_hl_exchange_throttled", False):
+            return
+        original = exchange.post
+
+        def wrapped(url_path: str, payload: Any = None) -> Any:
+            if not str(url_path).endswith("/exchange"):
+                return original(url_path, payload)
+            weight = exchange_weight_from_payload(payload)
+            self.throttle.acquire_exchange(weight)
+            try:
+                raw = original(url_path, payload)
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    self.budget.record("exchange", weight, kind="exchange", rate_limited=True)
+                raise
+            self.budget.record("exchange", weight, kind="exchange")
+            return raw
+
+        exchange.post = wrapped
+        exchange._hl_exchange_throttled = True
 
     def connect_sdk(self, *, for_trading: bool = False) -> None:
         if self._sdk_ready and (self._exchange is not None or not for_trading):
@@ -542,24 +669,66 @@ class HyperliquidClient:
             logger.info("已连接 Exchange，账户 %s（网络 %s）", address, self.cfg.network)
         self._sdk_ready = True
 
+    def _post_candles(self, symbol: str, interval: str, start_ms: int, end_ms: int) -> list[Any]:
+        raw = self._post_info(
+            {
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": symbol,
+                    "interval": interval,
+                    "startTime": int(start_ms),
+                    "endTime": int(end_ms),
+                },
+            }
+        )
+        if not isinstance(raw, list):
+            raise RuntimeError(f"candleSnapshot 返回不是列表: {symbol} {interval}")
+        return raw
+
     def fetch_candles(self, symbol: str, interval: str, count: int = 120) -> list[Candle]:
         now = int(time.time() * 1000)
-        span = INTERVAL_MS[interval] * (count + 2)
-        payload = {
-            "type": "candleSnapshot",
-            "req": {
-                "coin": symbol,
-                "interval": interval,
-                "startTime": now - span,
-                "endTime": now,
-            },
-        }
-        raw = self._post_info(payload)
-        candles = [candle_from_hl(item) for item in raw]
-        candles.sort(key=lambda c: c.ts)
-        # 去掉尚未收盘的最后一根，避免用影线/未完成K做突破确认
-        closed = [c for c in candles if c.end_ts < now]
-        return closed[-count:]
+        interval_ms = INTERVAL_MS[interval]
+        loaded = self.candle_cache.load(symbol, interval, interval_ms)
+        if loaded is not None:
+            cached, exhaustive = loaded
+            if len(cached) >= count or exhaustive:
+                start = cached[-1].ts - OVERLAP_BARS * interval_ms
+                try:
+                    fresh_raw = self._post_candles(symbol, interval, start, now)
+                    fresh = [candle_from_hl(item) for item in fresh_raw]
+                    merged = merge_closed(cached, fresh, interval_ms=interval_ms, now_ms=now)
+                except RateLimitError:
+                    raise
+                except (KeyError, TypeError, ValueError, RuntimeError):
+                    merged = None
+                if merged is not None:
+                    result = merged[-count:]
+                    self.candle_cache.save(
+                        symbol,
+                        interval,
+                        interval_ms,
+                        result,
+                        exhaustive=len(merged) < count,
+                    )
+                    self.budget.candle_incremental += 1
+                    return result
+                logger.info("K 线缓存有缺口或增量失败，全量回退 %s %s", symbol, interval)
+        span = interval_ms * (count + 2)
+        raw = self._post_candles(symbol, interval, now - span, now)
+        closed = [candle_from_hl(item) for item in raw]
+        closed.sort(key=lambda c: c.ts)
+        closed = [c for c in closed if c.end_ts < now]
+        result = closed[-count:]
+        if result:
+            self.candle_cache.save(
+                symbol,
+                interval,
+                interval_ms,
+                result,
+                exhaustive=len(closed) < count,
+            )
+        self.budget.candle_full += 1
+        return result
 
     def fetch_mids(self) -> dict[str, float]:
         raw = self._post_info({"type": "allMids"})
@@ -658,12 +827,42 @@ class HyperliquidClient:
                 logger.warning("读取%s失败: %s", label, exc)
                 return None, f"{label}: {exc}"
 
-    def read_live_equity(self) -> LiveEquityRead | None:
+    def fetch_account_snapshot(self) -> AccountSnapshot:
+        """每轮扫描读一次 perps + spot。成功的 perps 原文留给持仓解析复用。"""
+        if self.cfg.dry_run or not self.cfg.account_address:
+            return AccountSnapshot()
+        try:
+            self.connect_sdk(for_trading=False)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("connect_sdk 跳过，改走 REST /info: %s", exc)
+        address = self.cfg.account_address
+        perps_raw, perps_err = self._safe_info(
+            {"type": "clearinghouseState", "user": address},
+            label="perps clearinghouseState",
+        )
+        spot_raw, spot_err = self._safe_info(
+            {"type": "spotClearinghouseState", "user": address},
+            label="spotClearinghouseState",
+        )
+        if perps_err and _message_is_rate_limit(perps_err):
+            self._perps_rate_limited = True
+            self._perps_rate_limit_message = perps_err
+        elif self._share_book and isinstance(perps_raw, dict):
+            self.shared_perps_raw = perps_raw
+        return AccountSnapshot(
+            perps_raw=perps_raw,
+            spot_raw=spot_raw,
+            perps_error=perps_err,
+            spot_error=spot_err,
+        )
+
+    def read_live_equity(self, snapshot: AccountSnapshot | None = None) -> LiveEquityRead | None:
         """读取实盘权益并标明是否「完整」。
 
         complete=False 表示 perps / spot 任一侧读取失败，或需要账户模式去重却读不到模式且无缓存；
         此时 equity 只是部分值（例如 2026-09-29 03:25 现货 429 → 只剩 perps $36.25），
         调用方不应把它当真实权益。dry-run / 无地址返回 None。
+        传入本轮 AccountSnapshot 时不再重复请求 clearinghouseState / spotClearinghouseState。
         """
         if self.cfg.dry_run or not self.cfg.account_address:
             return None
@@ -675,14 +874,18 @@ class HyperliquidClient:
 
         address = self.cfg.account_address
         errors: list[str] = []
-        perps_raw, perps_err = self._safe_info(
-            {"type": "clearinghouseState", "user": address},
-            label="perps clearinghouseState",
-        )
-        spot_raw, spot_err = self._safe_info(
-            {"type": "spotClearinghouseState", "user": address},
-            label="spotClearinghouseState",
-        )
+        if snapshot is None:
+            perps_raw, perps_err = self._safe_info(
+                {"type": "clearinghouseState", "user": address},
+                label="perps clearinghouseState",
+            )
+            spot_raw, spot_err = self._safe_info(
+                {"type": "spotClearinghouseState", "user": address},
+                label="spotClearinghouseState",
+            )
+        else:
+            perps_raw, perps_err = snapshot.perps_raw, snapshot.perps_error
+            spot_raw, spot_err = snapshot.spot_raw, snapshot.spot_error
         if perps_err:
             errors.append(perps_err)
         if spot_err:
@@ -778,10 +981,21 @@ class HyperliquidClient:
         return self._exchange.update_leverage(lev, symbol, is_cross=not isolated)
 
     def fetch_open_orders(self) -> list[dict[str, Any]]:
-        """当前账户挂单（含 trigger 止损）。无地址时返回空列表。"""
+        """当前账户挂单（含 trigger 止损）。无地址时返回空列表。
+
+        同一轮扫描里第一次读取后复用，撤单后作废。
+        """
         address = self.cfg.account_address
         if not address:
             return []
+        if self._share_book and self.shared_open_orders is not None:
+            return [dict(row) for row in self.shared_open_orders]
+        orders = self._load_open_orders(address)
+        if self._share_book:
+            self.shared_open_orders = list(orders)
+        return [dict(row) for row in orders]
+
+    def _load_open_orders(self, address: str) -> list[dict[str, Any]]:
         if self._info is not None and hasattr(self._info, "frontend_open_orders"):
             try:
                 raw = self._info.frontend_open_orders(address)
@@ -796,22 +1010,34 @@ class HyperliquidClient:
         return list(raw or [])
 
     def fetch_perp_positions(self) -> dict[str, ExchangePosition]:
-        """永续持仓。无地址时返回空。429 向上抛，由扫描循环退避。"""
+        """永续持仓。无地址时返回空。429 向上抛，由扫描循环退避。
+
+        本轮已经成功读过 clearinghouseState 时直接解析那一份，不再请求。
+        """
         address = self.cfg.account_address
         if not address:
             return {}
+        if self._perps_rate_limited:
+            raise RateLimitError(self._perps_rate_limit_message or "clearinghouseState 429")
+        if self._share_book and isinstance(self.shared_perps_raw, dict):
+            return parse_perp_positions(self.shared_perps_raw)
+        raw = self._load_perp_state(address)
+        if self._share_book and isinstance(raw, dict):
+            self.shared_perps_raw = raw
+        return parse_perp_positions(raw)
+
+    def _load_perp_state(self, address: str) -> Any:
         if self._info is not None and hasattr(self._info, "user_state"):
             try:
                 raw = self._info.user_state(address)
                 if isinstance(raw, dict):
-                    return parse_perp_positions(raw)
+                    return raw
             except Exception as exc:
                 if is_rate_limit_error(exc):
                     logger.warning("SDK user_state 429，改 REST /info: %s", exc)
                 else:
                     logger.debug("SDK user_state 失败，改 REST: %s", exc)
-        raw = self._post_info({"type": "clearinghouseState", "user": address})
-        return parse_perp_positions(raw)
+        return self._post_info({"type": "clearinghouseState", "user": address})
 
     def _limit_tif(self, kind: OrderKind) -> str:
         return "Alo" if kind is OrderKind.MAKER_LIMIT else "Gtc"
@@ -833,6 +1059,8 @@ class HyperliquidClient:
         cancelled: list[int] = []
         if self._exchange is None:
             return cancelled
+        if oids:
+            self.shared_open_orders = None
         for oid in _unique_oids(oids):
             try:
                 self._exchange.cancel(symbol, int(oid))

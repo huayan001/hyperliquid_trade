@@ -12,6 +12,7 @@ htmlcov/
 dist/
 build/
 state/*.json
+state/candles/
 !state/.gitkeep
 .idea/
 .vscode/
