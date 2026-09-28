@@ -242,6 +242,8 @@ class RateLimitError(RuntimeError):
 _RATE_LIMIT_ATTEMPTS = 5
 _RATE_LIMIT_BASE_DELAY = 2.0
 _RATE_LIMIT_MAX_DELAY = 60.0
+# SDK Info 路径抛出的 429 没有内置退避；REST 路径由 _post_info 自己重试
+_SDK_INFO_RETRIES = 2
 
 
 def is_rate_limit_error(exc: BaseException | None) -> bool:
@@ -260,6 +262,17 @@ def is_rate_limit_error(exc: BaseException | None) -> bool:
         nxt = current.__cause__ if current.__cause__ is not None else current.__context__
         current = nxt if nxt is not current else None
     return False
+
+
+@dataclass(frozen=True, slots=True)
+class LiveEquityRead:
+    """一次实盘权益读取结果；complete=False 时 equity 只是部分值，不可直接当权益用。"""
+
+    equity: float
+    complete: bool
+    formula: str
+    abstraction: str | None
+    errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +454,8 @@ class HyperliquidClient:
         self.cfg = cfg
         self.base_url = cfg.api_url.rstrip("/")
         self._info = None
+        # 最近一次成功读到的账户模式（unifiedAccount 等），userAbstraction 429 时沿用
+        self.last_abstraction: str | None = None
         self._exchange = None
         self._sdk_ready = False
 
@@ -614,22 +629,44 @@ class HyperliquidClient:
                 return self._info.spot_user_state(payload["user"])
         return self._post_info(payload)
 
-    def _safe_info(self, payload: dict[str, Any], *, label: str) -> tuple[Any, str | None]:
-        try:
-            return self._fetch_info(payload), None
-        except Exception as exc:
-            logger.warning("读取%s失败: %s", label, exc)
-            return None, f"{label}: {exc}"
+    def _safe_info(
+        self,
+        payload: dict[str, Any],
+        *,
+        label: str,
+        retries: int = _SDK_INFO_RETRIES,
+    ) -> tuple[Any, str | None]:
+        """读 /info；SDK 路径的 429 不走 _post_info 的退避，这里补几次短重试。"""
+        delay = _RATE_LIMIT_BASE_DELAY
+        attempt = 0
+        while True:
+            try:
+                return self._fetch_info(payload), None
+            except Exception as exc:
+                # 仅 SDK 路径补重试；REST 路径（RateLimitError）已在 _post_info 内重试耗尽，不再叠加
+                if (
+                    attempt < retries
+                    and self._info is not None
+                    and is_rate_limit_error(exc)
+                    and not isinstance(exc, RateLimitError)
+                ):
+                    attempt += 1
+                    logger.warning("读取%s遇到 429，%.1fs 后重试 (%d/%d)", label, delay, attempt, retries)
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+                    continue
+                logger.warning("读取%s失败: %s", label, exc)
+                return None, f"{label}: {exc}"
 
-    def account_equity(self, fallback: float) -> float:
-        """实盘权益对齐 App「可用」：perps accountValue + 可用现货 USDC（按账户模式去重）。
+    def read_live_equity(self) -> LiveEquityRead | None:
+        """读取实盘权益并标明是否「完整」。
 
-        dry-run / 无地址时原样返回 fallback，纸盘路径不变。
-        任一 /info 失败时：能读到的一侧仍计入；两侧都失败或结果为 0 且有失败则回退 fallback，
-        避免「现货其实有 USDC、却因 perps=0 / 429 静默显示 $0」。
+        complete=False 表示 perps / spot 任一侧读取失败，或需要账户模式去重却读不到模式且无缓存；
+        此时 equity 只是部分值（例如 2026-09-29 03:25 现货 429 → 只剩 perps $36.25），
+        调用方不应把它当真实权益。dry-run / 无地址返回 None。
         """
         if self.cfg.dry_run or not self.cfg.account_address:
-            return fallback
+            return None
 
         try:
             self.connect_sdk(for_trading=False)
@@ -652,9 +689,15 @@ class HyperliquidClient:
             errors.append(spot_err)
 
         if perps_raw is None and spot_raw is None:
-            logger.warning("读取账户权益失败，回退模拟权益: %s", "; ".join(errors))
-            return fallback
+            return LiveEquityRead(
+                equity=0.0,
+                complete=False,
+                formula="none",
+                abstraction=None,
+                errors=tuple(errors),
+            )
 
+        complete = perps_raw is not None and spot_raw is not None
         abstraction = None
         # 仅当两侧都有正数时才需要模式，用来避免 unified 下同一桶 USDC 加两次
         preview = combine_live_equity(perps_raw, spot_raw, None)
@@ -664,24 +707,26 @@ class HyperliquidClient:
                 label="userAbstraction",
             )
             if abs_err:
-                logger.info("未读到账户模式，按标准账户相加 perps+现货: %s", abs_err)
+                if self.last_abstraction:
+                    abstraction = self.last_abstraction
+                    logger.info("未读到账户模式，沿用上次成功读取的模式 %s: %s", abstraction, abs_err)
+                else:
+                    complete = False
+                    errors.append(abs_err)
+                    logger.info("未读到账户模式且无缓存，按标准账户相加 perps+现货（标记为不完整）: %s", abs_err)
+            elif abstraction:
+                self.last_abstraction = str(abstraction)
 
         breakdown = combine_live_equity(perps_raw, spot_raw, abstraction)
-        if breakdown.equity <= 0 and errors:
-            logger.warning(
-                "权益计算结果为 0 且部分接口失败，回退模拟权益: %s",
-                "; ".join(errors),
-            )
-            return fallback
-
         logger.info(
-            "实盘权益 $%.2f [%s] 计入=%s perps=$%.2f 可用现货USDC=$%.2f abstraction=%s",
+            "实盘权益 $%.2f [%s] 计入=%s perps=$%.2f 可用现货USDC=$%.2f abstraction=%s%s",
             breakdown.equity,
             breakdown.formula,
             ",".join(breakdown.included) or "none",
             breakdown.perps_value,
             breakdown.free_spot_usdc,
             breakdown.abstraction or "unknown",
+            "" if complete else " (不完整读取)",
         )
         logger.debug(
             "权益明细 formula=%s perps=%s spot=%s abstraction=%s errors=%s",
@@ -691,7 +736,28 @@ class HyperliquidClient:
             breakdown.abstraction,
             errors or None,
         )
-        return breakdown.equity
+        return LiveEquityRead(
+            equity=breakdown.equity,
+            complete=complete,
+            formula=breakdown.formula,
+            abstraction=breakdown.abstraction,
+            errors=tuple(errors),
+        )
+
+    def account_equity(self, fallback: float) -> float:
+        """实盘权益对齐 App「可用」：perps accountValue + 可用现货 USDC（按账户模式去重）。
+
+        dry-run / 无地址时原样返回 fallback，纸盘路径不变。
+        兼容旧接口：两侧都失败或结果为 0 且有失败则回退 fallback。
+        实盘循环请用 read_live_equity() + BotRunner 的缓存/可疑读数判断。
+        """
+        reading = self.read_live_equity()
+        if reading is None:
+            return fallback
+        if reading.equity <= 0 and reading.errors:
+            logger.warning("读取账户权益失败，回退模拟权益: %s", "; ".join(reading.errors))
+            return fallback
+        return reading.equity
 
     def round_size(self, symbol: str, size: float, sz_decimals: int | None = None) -> float:
         dec = sz_decimals if sz_decimals is not None else 4
