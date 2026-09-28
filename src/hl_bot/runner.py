@@ -51,6 +51,13 @@ from hl_bot.strategies.trend import TrendStrategy
 logger = logging.getLogger(__name__)
 
 
+# 权益缓存：可接受的最大年龄；单轮下跌超过该比例且无已实现亏损视为可疑读数
+EQUITY_CACHE_MAX_AGE_MS = 24 * 3600 * 1000
+EQUITY_SUSPECT_DROP_PCT = 0.5
+# 可疑读数连续两轮在该相对误差内一致则接受（避免真实大跌时永久卡在缓存）
+EQUITY_SUSPECT_CONFIRM_TOL = 0.10
+
+
 @dataclass
 class SymbolReport:
     symbol: str
@@ -98,6 +105,13 @@ class BotRunner:
         self._exchange_positions: dict[str, ExchangePosition] = {}
         self._asset_ctxs: dict = {}
         self._live_book_ok = True
+        # 本轮权益是否可信（实时读数或新鲜缓存）；False 时只管理止损/离场，不开新仓/加仓
+        self._equity_ok = True
+        # 上一轮被判为可疑的权益读数；连续两轮一致则视为真实变化而接受
+        self._suspect_equity: float | None = None
+        if self.account.equity_abstraction and hasattr(self.client, "last_abstraction"):
+            if not getattr(self.client, "last_abstraction", None):
+                self.client.last_abstraction = self.account.equity_abstraction
 
     @property
     def account(self) -> AccountState:
@@ -115,10 +129,7 @@ class BotRunner:
             self.account.week_key = week_key
 
         if not self.cfg.dry_run:
-            try:
-                self.account.equity = self.client.account_equity(self.account.equity)
-            except Exception as exc:
-                logger.warning("读取实盘权益失败: %s", exc)
+            self._refresh_live_equity(now_ms)
 
         ctxs = self.client.fetch_asset_contexts()
         self._asset_ctxs = ctxs
@@ -265,6 +276,96 @@ class BotRunner:
             generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             symbols=reports,
             skipped=skipped,
+        )
+
+    def _cached_equity(self, now_ms: int) -> tuple[float, float] | None:
+        """返回 (缓存权益, 距今小时数)；无缓存或超过 EQUITY_CACHE_MAX_AGE_MS 返回 None。"""
+        acct = self.account
+        if acct.last_good_equity <= 0 or acct.last_good_equity_ts_ms <= 0:
+            return None
+        age_ms = now_ms - acct.last_good_equity_ts_ms
+        if age_ms < 0 or age_ms > EQUITY_CACHE_MAX_AGE_MS:
+            return None
+        return acct.last_good_equity, age_ms / 3_600_000.0
+
+    def _realized_loss_since_last_good(self) -> float:
+        acct = self.account
+        if acct.last_good_day_key and acct.last_good_day_key == acct.day_key:
+            delta = acct.realized_pnl_today - acct.last_good_realized_pnl
+        else:
+            delta = acct.realized_pnl_today
+        return max(0.0, -delta)
+
+    def _is_suspect_equity(self, value: float, now_ms: int) -> bool:
+        """单轮权益较上次可信值下跌 >50% 且无对应已实现亏损 → 可疑读数。"""
+        cached = self._cached_equity(now_ms)
+        if cached is None:
+            return False
+        last_good, _ = cached
+        unexplained_drop = last_good - self._realized_loss_since_last_good() - value
+        return unexplained_drop > last_good * EQUITY_SUSPECT_DROP_PCT
+
+    def _accept_equity(self, value: float, now_ms: int, abstraction: str | None) -> None:
+        acct = self.account
+        acct.equity = value
+        acct.last_good_equity = value
+        acct.last_good_equity_ts_ms = now_ms
+        acct.last_good_realized_pnl = acct.realized_pnl_today
+        acct.last_good_day_key = acct.day_key
+        if abstraction:
+            acct.equity_abstraction = str(abstraction)
+        self._suspect_equity = None
+        self._equity_ok = True
+
+    def _refresh_live_equity(self, now_ms: int) -> None:
+        """实盘权益：完整读数才采用；失败/部分/可疑时用 24h 内缓存，否则本轮禁止开新仓/加仓。"""
+        self._equity_ok = True
+        reading = None
+        try:
+            reading = self.client.read_live_equity()
+        except Exception as exc:
+            logger.warning("读取实盘权益异常: %s", exc)
+
+        if reading is not None and reading.complete and reading.equity > 0:
+            value = float(reading.equity)
+            if not self._is_suspect_equity(value, now_ms):
+                self._accept_equity(value, now_ms, reading.abstraction)
+                return
+            prev = self._suspect_equity
+            if prev is not None and prev > 0 and abs(value - prev) / prev <= EQUITY_SUSPECT_CONFIRM_TOL:
+                logger.warning(
+                    "权益 $%.2f 连续两轮一致（上轮 $%.2f），较缓存 $%.2f 大幅下降但视为真实变化并接受",
+                    value,
+                    prev,
+                    self.account.last_good_equity,
+                )
+                self._accept_equity(value, now_ms, reading.abstraction)
+                return
+            self._suspect_equity = value
+            reason = (
+                f"权益读数 ${value:.2f} 较上次可信值 ${self.account.last_good_equity:.2f} 单轮下跌超过"
+                f" {EQUITY_SUSPECT_DROP_PCT:.0%} 且无对应已实现亏损，判为可疑读数"
+            )
+        elif reading is None:
+            reason = "权益读取异常"
+        else:
+            reason = (
+                f"权益读取不完整（部分值 ${reading.equity:.2f}，formula={reading.formula}，"
+                f"errors={'; '.join(reading.errors) or '-'}）"
+            )
+            self._suspect_equity = None
+
+        cached = self._cached_equity(now_ms)
+        if cached is not None:
+            value, age_h = cached
+            self.account.equity = value
+            logger.warning("%s → 使用缓存权益 $%.2f（%.1f 小时前读取）", reason, value, age_h)
+            return
+        self._equity_ok = False
+        logger.warning(
+            "%s，且无 24h 内有效缓存权益 → 本轮不开新仓/加仓，仅管理止损与离场（沿用权益 $%.2f 仅作展示）",
+            reason,
+            self.account.equity,
         )
 
     def _exits_for(self, market: MarketSnapshot, decision: RegimeDecision, now_ms: int) -> list[OrderIntent]:
@@ -728,6 +829,9 @@ class BotRunner:
         if not self.cfg.dry_run and intent.action in (IntentAction.OPEN, IntentAction.ADD) and not intent.reduce_only:
             if not self._live_book_ok:
                 logger.warning("%s 本轮未读到挂单，跳过 %s 以免同价堆叠", intent.symbol, intent.action.value)
+                return
+            if not self._equity_ok:
+                logger.warning("%s 本轮权益不可信且无有效缓存，跳过 %s", intent.symbol, intent.action.value)
                 return
             blocked = self._resting_block_reason(intent)
             if blocked:

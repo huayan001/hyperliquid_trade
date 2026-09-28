@@ -114,6 +114,11 @@ class PaperBroker:
             "week_key": self.account.week_key,
             "realized_pnl_today": self.account.realized_pnl_today,
             "day_trades": self.account.day_trades,
+            "last_good_equity": self.account.last_good_equity,
+            "last_good_equity_ts_ms": self.account.last_good_equity_ts_ms,
+            "last_good_realized_pnl": self.account.last_good_realized_pnl,
+            "last_good_day_key": self.account.last_good_day_key,
+            "equity_abstraction": self.account.equity_abstraction,
             "positions": [
                 {
                     "symbol": p.symbol,
@@ -157,6 +162,11 @@ class PaperBroker:
             week_key=str(raw.get("week_key") or week_key),
             realized_pnl_today=float(raw.get("realized_pnl_today") or 0.0),
             day_trades={str(k): int(v) for k, v in (raw.get("day_trades") or {}).items()},
+            last_good_equity=float(raw.get("last_good_equity") or 0.0),
+            last_good_equity_ts_ms=int(raw.get("last_good_equity_ts_ms") or 0),
+            last_good_realized_pnl=float(raw.get("last_good_realized_pnl") or 0.0),
+            last_good_day_key=str(raw.get("last_good_day_key") or ""),
+            equity_abstraction=str(raw.get("equity_abstraction") or ""),
         )
         if account.day_key != day_key:
             account.day_start_equity = account.equity

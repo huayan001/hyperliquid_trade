@@ -296,6 +296,14 @@ class AccountState:
     day_key: str = ""
     week_key: str = ""
     resting_entries: list[RestingEntry] = field(default_factory=list)
+    # 实盘：最近一次「完整且可信」的权益读数，供 429 / 部分读取失败时回退
+    last_good_equity: float = 0.0
+    last_good_equity_ts_ms: int = 0
+    # 记录 last_good 时的当日已实现盈亏与 day_key，用来判断权益骤降是否有对应的已实现亏损
+    last_good_realized_pnl: float = 0.0
+    last_good_day_key: str = ""
+    # 最近一次成功读到的账户模式（unifiedAccount 等）
+    equity_abstraction: str = ""
 
     def open_positions(self) -> list[Position]:
         return [p for p in self.positions if p.size > 0]
