@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from hl_bot.alerts import AlertSink
 from hl_bot.config import BotConfig
 from hl_bot.exchange.client import (
+    AccountSnapshot,
     ExchangePosition,
     HyperliquidClient,
     extract_oid,
@@ -118,6 +119,13 @@ class BotRunner:
         return self.broker.account
 
     def scan_once(self, *, persist_paper: bool = False) -> ScanReport:
+        self.client.begin_scan()
+        try:
+            return self._scan_once_inner(persist_paper=persist_paper)
+        finally:
+            self.client.end_scan()
+
+    def _scan_once_inner(self, *, persist_paper: bool = False) -> ScanReport:
         day_key, week_key, now_ms = _utc_keys()
         if self.account.day_key != day_key:
             self.account.day_start_equity = self.account.equity
@@ -129,7 +137,8 @@ class BotRunner:
             self.account.week_key = week_key
 
         if not self.cfg.dry_run:
-            self._refresh_live_equity(now_ms)
+            snapshot = self.client.fetch_account_snapshot()
+            self._refresh_live_equity(now_ms, snapshot)
 
         ctxs = self.client.fetch_asset_contexts()
         self._asset_ctxs = ctxs
@@ -317,12 +326,15 @@ class BotRunner:
         self._suspect_equity = None
         self._equity_ok = True
 
-    def _refresh_live_equity(self, now_ms: int) -> None:
+    def _refresh_live_equity(self, now_ms: int, snapshot: AccountSnapshot | None = None) -> None:
         """实盘权益：完整读数才采用；失败/部分/可疑时用 24h 内缓存，否则本轮禁止开新仓/加仓。"""
         self._equity_ok = True
         reading = None
         try:
-            reading = self.client.read_live_equity()
+            if snapshot is None:
+                reading = self.client.read_live_equity()
+            else:
+                reading = self.client.read_live_equity(snapshot)
         except Exception as exc:
             logger.warning("读取实盘权益异常: %s", exc)
 
@@ -629,6 +641,7 @@ class BotRunner:
         if not changed:
             return
         try:
+            self.client.shared_perps_raw = None
             refreshed = self.client.fetch_perp_positions()
         except Exception as exc:
             if is_rate_limit_error(exc):
