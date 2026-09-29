@@ -73,13 +73,23 @@ cp .env.example .env
 | `HL_PAPER_EQUITY` | dry-run / 纸盘模拟权益，默认 `10000`。实盘扫描改读交易所权益，见下节 |
 | `HL_SYMBOLS` | 默认 `BTC,ETH,SOL,HYPE`（实盘小资金常用 `ETH,SOL,HYPE`） |
 | `HL_LEVERAGE` | 统一目标杠杆，默认 `10`（开仓前 `updateLeverage`） |
-| `HL_RISK_PCT` | 单笔风险占权益比例，默认 `0.02`（仓位由止损距离反推） |
+| `HL_RISK_PCT` | 单笔风险占权益比例，默认 `0.02`（仓位由止损距离反推）。若设置了该变量，会覆盖 `config.toml` 里趋势和均值回归的 `risk_pct` |
 | `HL_LIQ_BUFFER_FRAC` | 止损距 ≤ `(1/杠杆)×该值`，默认 `0.50`，避免强平抢先 |
 | `HL_PRIVATE_KEY` | 仅实盘需要 |
 | `HL_ACCOUNT_ADDRESS` | 使用 API Wallet / Agent 时填**主账户**地址 |
 | `HL_ENABLE_LIVE` | 实盘总闸，必须为 `1` 且命令行加 `--live` |
 
-标的、ADX 阈值、风险比例等见 `config.toml`。
+标的、ADX 阈值、风险比例等见 `config.toml`。配置里趋势 `risk_pct` 现为 `0.01`；实盘进程若带了 `HL_RISK_PCT`，以环境变量为准。
+
+BTC 日线 ADX 开关（预注册 D-P，先观察再执行）在 `[trend]`：
+
+| 键 | 含义 |
+|---|---|
+| `btc_regime_mode` | `off`（代码默认：不拉 BTC 日线、不改任何订单）/ `shadow`（只记日志，不拦截）/ `enforce`（低于阈值时跳过新的趋势开仓） |
+| `btc_regime_adx_min` | 阈值，默认 `23.35` |
+| `btc_regime_adx_period` | ADX 周期，默认 `14` |
+
+当前配置是 `shadow`。只在趋势策略的**新开仓**（含 starter，且冷却和风控都已通过、下单之前）看 BTC **已收盘**日线 ADX。低于阈值仍照常下单，并往 `state/btc_regime_shadow.jsonl` 追加一行（`would_block: true/false` 两组都记，方便事后对比）。`enforce` 才真正跳过，并写 `blocked: true`。加仓、金字塔、止损、离场、均值回归不走这条。读 K 线或算 ADX 失败时放行。同一 UTC 日只拉一次 BTC 日线。
 
 ## 实盘权益（对齐 App「可用」）
 

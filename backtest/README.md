@@ -4,6 +4,8 @@
 
 短线预注册候选 A/B/C 与 B2 统计扫描见 [`short/README.md`](short/README.md)。
 
+趋势侧预注册实验 D（10 个 chop 开关，选中 D-P：BTC 日线 ADX(14) < 23.35 时暂停新趋势开仓；TEST 已消耗）见 [`trend_D/README.md`](trend_D/README.md)。实盘先以 1% 风险 + `btc_regime_mode = shadow` 观察，不在本目录重跑。
+
 ## 文件
 
 | 文件 | 说明 |

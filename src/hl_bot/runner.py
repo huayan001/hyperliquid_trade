@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from hl_bot.alerts import AlertSink
+from hl_bot.btc_regime import BtcRegimeGate, shadow_log_path
 from hl_bot.config import BotConfig
 from hl_bot.exchange.client import (
     AccountSnapshot,
@@ -113,6 +114,7 @@ class BotRunner:
         self.risk = RiskManager(cfg)
         self.trend = TrendStrategy(cfg.trend)
         self.mr = MeanReversionStrategy(cfg.mean_reversion)
+        self.btc_regime = BtcRegimeGate(cfg.trend, self.client, shadow_log_path(cfg.state_path))
         day_key, week_key, _ = _utc_keys()
         self.broker = PaperBroker.load(cfg.state_path, cfg.paper_equity, day_key, week_key)
         self._open_orders: list[dict] | None = None
@@ -274,6 +276,19 @@ class BotRunner:
                 )
                 if verdict.allowed:
                     intent = self.risk.to_open_intent(signal, verdict, isolated=self.cfg.risk.isolated)
+                    # 新趋势开仓（含 starter）在其它检查通过、真正下单之前看 BTC 日线 ADX。
+                    # mode=off 不进入，不拉 K 线，订单路径与未加此功能时相同。
+                    if (
+                        intent is not None
+                        and self.btc_regime.mode != "off"
+                        and signal.strategy is StrategyName.TREND
+                        and decision.regime.is_trend()
+                    ):
+                        try:
+                            if self.btc_regime.blocks_new_entry(signal.symbol, signal.side.value, now_ms, notes):
+                                intent = None
+                        except Exception as exc:
+                            logger.warning("BTC regime 判断异常，fail-open 不拦截 %s: %s", symbol, exc)
                     if intent:
                         self._execute(intent, now_ms, persist_paper=persist_paper)
                         same_way.append(f"{symbol}:{signal.side.value}")

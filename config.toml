@@ -34,7 +34,7 @@ trail_step_atr = 1.0
 trail_offset_atr = 0.5
 chase_body_atr = 1.5
 chase_symbols = ["BTC"]
-risk_pct = 0.02               # 单笔风险 2% 权益
+risk_pct = 0.01               # 单笔风险 1% 权益（实盘若设了 HL_RISK_PCT，仍以环境变量为准）
 btc_short_risk_mult = 0.7
 max_positions = 2
 portfolio_risk_max = 0.04
@@ -59,6 +59,11 @@ starter_frac = 0.35
 starter_symbols = []
 # 止损出场后同标的同方向冷却：至少等 N 根已收盘 4h K 线（0 = 关闭）
 stop_cooldown_bars_4h = 2
+# BTC 日线 ADX 开关：off 不拉取、不改订单；shadow 只记录不拦截；enforce 低于阈值时跳过新趋势开仓
+# （不含加仓、止损、离场、均值回归）。当前先 shadow 观察 4–8 周。
+btc_regime_mode = "shadow"
+btc_regime_adx_min = 23.35
+btc_regime_adx_period = 14
 
 [mean_reversion]
 bb_period = 20

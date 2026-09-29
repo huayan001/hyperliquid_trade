@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,7 @@ MAINNET_WS_URL = "wss://api.hyperliquid.xyz/ws"
 TESTNET_WS_URL = "wss://api.hyperliquid-testnet.xyz/ws"
 
 DEFAULT_SYMBOLS = ("BTC", "ETH", "SOL", "HYPE")
+BTC_REGIME_MODES = ("off", "shadow", "enforce")
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -93,6 +95,10 @@ class TrendConfig:
     starter_symbols: tuple[str, ...] = ()
     # 止损出场后，同标的同方向至少等待 N 根已收盘 4h K 线才允许再开新仓（0 = 关闭）
     stop_cooldown_bars_4h: int = 2
+    # BTC 日线 ADX 开关。off 不拉行情、不改任何订单；shadow 只记日志；enforce 才跳过新趋势开仓。
+    btc_regime_mode: str = "off"
+    btc_regime_adx_min: float = 23.35
+    btc_regime_adx_period: int = 14
 
 
 @dataclass(slots=True)
@@ -167,6 +173,31 @@ class BotConfig:
             raise RuntimeError("实盘被拒绝：请同时设置 HL_ENABLE_LIVE=1 并传入 --live。")
         if not self.private_key:
             raise RuntimeError("实盘需要环境变量 HL_PRIVATE_KEY。")
+
+
+def _parse_btc_regime_mode(value: Any) -> str:
+    if value is None or value == "":
+        return "off"
+    mode = str(value).strip().lower()
+    if mode not in BTC_REGIME_MODES:
+        raise ValueError(
+            f"trend.btc_regime_mode 必须是 off、shadow 或 enforce，收到 {value!r}"
+        )
+    return mode
+
+
+def _parse_btc_regime_adx_min(value: Any) -> float:
+    number = _as_float(value, 23.35)
+    if math.isnan(number) or number <= 0 or number > 100:
+        raise ValueError(f"trend.btc_regime_adx_min 必须在 (0, 100] 内，收到 {value!r}")
+    return number
+
+
+def _parse_btc_regime_period(value: Any) -> int:
+    number = _as_int(value, 14)
+    if number < 2 or number > 100:
+        raise ValueError(f"trend.btc_regime_adx_period 必须是 2–100 的整数，收到 {value!r}")
+    return number
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -247,6 +278,9 @@ def load_config(
             starter_frac=_as_float(trend_raw.get("starter_frac"), 0.35),
             starter_symbols=_as_list(trend_raw.get("starter_symbols"), ()),
             stop_cooldown_bars_4h=_as_int(trend_raw.get("stop_cooldown_bars_4h"), 2),
+            btc_regime_mode=_parse_btc_regime_mode(trend_raw.get("btc_regime_mode")),
+            btc_regime_adx_min=_parse_btc_regime_adx_min(trend_raw.get("btc_regime_adx_min")),
+            btc_regime_adx_period=_parse_btc_regime_period(trend_raw.get("btc_regime_adx_period")),
         ),
         mean_reversion=MeanReversionConfig(
             bb_period=_as_int(mr_raw.get("bb_period"), 20),

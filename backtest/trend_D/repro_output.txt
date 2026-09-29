@@ -1,0 +1,2 @@
+[2026-09-29 16:09:58 CST] repro HL L0@2%: bt.Sim ret=-0.1842 mdd=0.2781 n=84 | DSim identical=True
+[2026-09-29 16:10:01 CST] repro long L0@2%: bt.Sim ret=+2.1864 mdd=0.5179 n=348 | DSim ret=+2.1864 mdd=0.5179 n=348 | identical=True
