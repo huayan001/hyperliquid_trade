@@ -12,6 +12,7 @@ htmlcov/
 dist/
 build/
 state/*.json
+state/*.jsonl
 state/candles/
 !state/.gitkeep
 .idea/
@@ -25,4 +26,5 @@ backtest/**/data/
 backtest/**/data_long/
 backtest/results*.pkl
 backtest/**/*.pkl
+backtest/trend_D/*.pkl
 backtest/__pycache__/
