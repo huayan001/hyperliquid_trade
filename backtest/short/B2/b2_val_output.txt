@@ -1,0 +1,10 @@
+### b2.py val 2026-09-29 15:07:44 CST
+RS1-E1  [long/val] signals=83 trades=44 ret=+2.69% mdd=2.1% pf=1.54 win=52% avgR=+0.122 avgWin=$3.34 avgLoss=$-2.38 fees=$4.5 (6% of gross) fund=$+0.56 exits={'time': 38, 'stop': 6} per-sym pnl={'BTC': 11.3, 'ETH': -6.7, 'SOL': -2.1, 'HYPE': 24.4}
+RS1-E3  [long/val] signals=83 trades=37 ret=+1.66% mdd=2.0% pf=1.38 win=51% avgR=+0.091 avgWin=$3.18 avgLoss=$-2.43 fees=$3.7 (6% of gross) fund=$+0.38 exits={'time': 31, 'stop': 6} per-sym pnl={'BTC': 7.8, 'ETH': -6.8, 'SOL': -0.7, 'HYPE': 16.3}
+RS2-E1  [long/val] signals=156 trades=65 ret=+9.88% mdd=2.5% pf=2.34 win=58% avgR=+0.295 avgWin=$4.55 avgLoss=$-2.74 fees=$6.9 (4% of gross) fund=$+0.96 exits={'time': 56, 'stop': 9} per-sym pnl={'BTC': 16.1, 'ETH': 21.0, 'SOL': 24.6, 'HYPE': 37.1}
+RS2-E3  [long/val] signals=156 trades=58 ret=+5.78% mdd=2.2% pf=1.88 win=59% avgR=+0.196 avgWin=$3.63 avgLoss=$-2.74 fees=$5.8 (5% of gross) fund=$+0.70 exits={'time': 49, 'stop': 9} per-sym pnl={'BTC': 16.0, 'ETH': -10.5, 'SOL': 27.6, 'HYPE': 24.7}
+CHOSEN = RS2-E1 (trades>=30 且 费/毛利<30% 中 PF 最高)
+
+real	0m9.950s
+user	0m9.796s
+sys	0m0.151s

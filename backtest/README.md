@@ -2,6 +2,8 @@
 
 复用仓库 `src/hl_bot` 的指标、环境路由（`hl_bot.regime`）和参数口径，对现行策略（V0/L0）、Claude Code 提出的改版（V1–V4）以及均值回归（MR）做组合回测。
 
+短线预注册候选 A/B/C 与 B2 统计扫描见 [`short/README.md`](short/README.md)。
+
 ## 文件
 
 | 文件 | 说明 |
