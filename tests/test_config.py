@@ -44,6 +44,26 @@ def test_trend_starter_defaults_and_toml() -> None:
     assert cfg.trend.starter_symbols == ()
 
 
+def test_trend_daily_loss_halt_loaded_from_toml(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("HL_RISK_PCT", raising=False)
+    cfg = load_config("config.toml")
+    assert cfg.trend.max_positions == 4
+    assert abs(cfg.trend.portfolio_risk_max - 0.04) < 1e-12
+    assert abs(cfg.trend.daily_loss_halt - 0.03) < 1e-12
+    assert abs(cfg.trend.daily_loss_delever - 0.05) < 1e-12
+    assert abs(cfg.trend.weekly_loss_delever - 0.10) < 1e-12
+    assert abs(cfg.trend.risk_pct - 0.01) < 1e-12
+    assert abs(cfg.mean_reversion.daily_loss_halt - 0.02) < 1e-12
+    assert abs(cfg.mean_reversion.risk_pct - 0.02) < 1e-12
+
+    assert BotConfig().trend.daily_loss_halt == 0.0
+    missing = tmp_path / "no_halt.toml"
+    missing.write_text("[trend]\nmax_positions = 2\n", encoding="utf-8")
+    defaults = load_config(missing)
+    assert defaults.trend.daily_loss_halt == 0.0
+    assert defaults.trend.max_positions == 2
+
+
 def test_hl_leverage_and_risk_pct_env(monkeypatch) -> None:
     monkeypatch.setenv("HL_LEVERAGE", "10")
     monkeypatch.setenv("HL_RISK_PCT", "0.02")

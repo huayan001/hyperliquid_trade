@@ -1,6 +1,9 @@
+import logging
+
 from hl_bot.config import BotConfig
-from hl_bot.models import AccountState, Position, Side, Signal, StrategyName
+from hl_bot.models import AccountState, IntentAction, OrderIntent, OrderKind, Position, Side, Signal, StrategyName
 from hl_bot.risk import RiskManager, derive_position_size
+from hl_bot.runner import format_report
 
 
 def _account(equity: float = 10_000, positions: list[Position] | None = None) -> AccountState:
@@ -207,3 +210,160 @@ def test_evaluate_open_tightens_wide_stop_before_sizing() -> None:
     assert intent is not None
     assert abs(intent.stop_price - 95.0) < 1e-9
     assert intent.leverage == 10
+
+
+def _trend_cfg(*, halt: float = 0.0, max_positions: int = 4) -> BotConfig:
+    cfg = BotConfig()
+    cfg.trend.daily_loss_halt = halt
+    cfg.trend.max_positions = max_positions
+    cfg.trend.portfolio_risk_max = 0.04
+    cfg.trend.risk_pct = 0.01
+    cfg.risk.target_leverage = 10
+    cfg.risk.liq_buffer_frac = 0.5
+    return cfg
+
+
+def _one_pct_position(symbol: str, *, equity: float = 10_000) -> Position:
+    """止损距离 5%，仓位风险正好是权益的 1%。"""
+    entry, stop = 100.0, 95.0
+    size = (equity * 0.01) / (entry - stop)
+    return Position(
+        symbol=symbol,
+        strategy=StrategyName.TREND,
+        side=Side.LONG,
+        size=size,
+        entry_price=entry,
+        stop_price=stop,
+        leverage=10,
+        opened_ts=0,
+    )
+
+
+def _loss_account(loss_pct: float, positions: list[Position] | None = None, equity: float = 10_000) -> AccountState:
+    acct = _account(equity, positions)
+    acct.day_start_equity = equity
+    acct.equity = equity * (1.0 - loss_pct)
+    return acct
+
+
+def test_trend_daily_loss_halt_blocks_new_entry_at_threshold() -> None:
+    rm = RiskManager(_trend_cfg(halt=0.03))
+    verdict = rm.evaluate_open(_signal("ETH", entry=100, stop=95), _loss_account(0.03))
+    assert not verdict.allowed
+    assert verdict.reason == "趋势策略：当日亏损已达 3% 上限，停止新开仓"
+    # 趋势停开仓不套到均值回归；均值回归仍只用自己的 daily_loss_halt
+    cfg = _trend_cfg(halt=0.03)
+    cfg.mean_reversion.daily_loss_halt = 0.10
+    mr = RiskManager(cfg).evaluate_open(
+        _signal("SOL", strategy=StrategyName.MEAN_REVERSION, entry=100, stop=98),
+        _loss_account(0.03),
+    )
+    assert mr.allowed, mr.reason
+
+
+def test_trend_daily_loss_halt_allows_below_threshold() -> None:
+    rm = RiskManager(_trend_cfg(halt=0.03))
+    verdict = rm.evaluate_open(_signal("ETH", entry=100, stop=95), _loss_account(0.029))
+    assert verdict.allowed, verdict.reason
+
+
+def test_trend_daily_loss_halt_zero_disables() -> None:
+    rm = RiskManager(_trend_cfg(halt=0.0))
+    # 4% 高于配置里的 3% 停开仓，但仍低于 5% 降杠杆，用来证明 halt=0 不拦截
+    verdict = rm.evaluate_open(_signal("ETH", entry=100, stop=95), _loss_account(0.04))
+    assert verdict.allowed, verdict.reason
+    assert verdict.size is not None
+    # 权益已是 9600，单笔风险仍是当前权益的 1%，只是没有被 halt 拦住
+    assert abs(verdict.size.risk_usd - 96) < 1e-6
+    assert abs(verdict.size.risk_pct - 0.01) < 1e-9
+
+
+def test_trend_four_positions_fit_portfolio_cap_and_fifth_rejected() -> None:
+    cfg = _trend_cfg(halt=0.0, max_positions=4)
+    rm = RiskManager(cfg)
+    third = rm.evaluate_open(
+        _signal("BTC", entry=100, stop=95),
+        _loss_account(0.0, [_one_pct_position("ETH"), _one_pct_position("SOL")]),
+    )
+    assert third.allowed, third.reason
+    assert third.size is not None
+    assert abs(third.size.risk_usd - 100) < 1e-6
+
+    fourth = rm.evaluate_open(
+        _signal("BTC", entry=100, stop=95),
+        _loss_account(0.0, [_one_pct_position(s) for s in ("ETH", "SOL", "HYPE")]),
+    )
+    assert fourth.allowed, fourth.reason
+    assert fourth.size is not None
+    assert abs(fourth.size.risk_usd - 100) < 1e-6
+
+    full = [_one_pct_position(s) for s in ("ETH", "SOL", "HYPE", "BTC")]
+    fifth = rm.evaluate_open(_signal("DOGE", entry=100, stop=95), _loss_account(0.0, full))
+    assert not fifth.allowed
+    assert "持仓数已满" in fifth.reason
+
+    # 即使把仓位数上限放开，第 5 笔 1% 也会顶破 4% 组合风险
+    cfg.trend.max_positions = 5
+    fifth_by_cap = rm.evaluate_open(_signal("DOGE", entry=100, stop=95), _loss_account(0.0, full))
+    assert not fifth_by_cap.allowed
+    assert "4%" in fifth_by_cap.reason
+
+
+def test_runner_logs_trend_halt_without_blocking_exit(tmp_path, monkeypatch, caplog) -> None:
+    from tests.test_btc_regime import _arm_open, _runner
+
+    runner, fetches, executed = _runner(tmp_path, monkeypatch, mode="shadow", symbols=("ETH", "SOL"))
+    runner.cfg.trend.daily_loss_halt = 0.03
+    runner.account.day_start_equity = 10_000
+    runner.account.equity = 9_700
+    _arm_open(runner, starter=False)
+    runner.account.positions.append(
+        Position(
+            symbol="SOL",
+            strategy=StrategyName.TREND,
+            side=Side.LONG,
+            size=1.0,
+            entry_price=100.0,
+            stop_price=90.0,
+            leverage=10,
+            opened_ts=1,
+            tag="donchian_close_breakout",
+            extras={"_opened_size": 1.0},
+        )
+    )
+    close = OrderIntent(
+        action=IntentAction.CLOSE,
+        symbol="SOL",
+        strategy=StrategyName.TREND,
+        side=Side.SHORT,
+        kind=OrderKind.MARKET,
+        size=1.0,
+        price=100.0,
+        stop_price=None,
+        leverage=10,
+        isolated=True,
+        reduce_only=True,
+        reason="趋势失效离场",
+    )
+
+    def exits(position, market, decision, now_ms):
+        if market.symbol == "SOL":
+            return [close]
+        return []
+
+    runner.trend.generate_exits = exits  # type: ignore[method-assign]
+    with caplog.at_level(logging.INFO, logger="hl_bot.runner"):
+        report = runner.scan_once()
+
+    opens = [item for item in executed if item.action is IntentAction.OPEN]
+    closes = [item for item in executed if item.action is IntentAction.CLOSE]
+    assert opens == []
+    assert closes == [close]
+    assert fetches == []
+    eth = next(item for item in report.symbols if item.symbol == "ETH")
+    assert any("停止新开仓" in note for note in eth.notes)
+    assert any("ETH 新开仓跳过" in rec.message and "停止新开仓" in rec.message for rec in caplog.records)
+    assert any("停止新开仓与金字塔加仓" in line for line in report.status)
+    printed = format_report(report)
+    assert "趋势策略：当日亏损已达 3% 上限" in printed
+    assert "停止新开仓与金字塔加仓" in printed

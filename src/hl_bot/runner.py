@@ -56,6 +56,7 @@ from hl_bot.risk import (
     apply_pyramid,
     apply_tier_add,
     clamp_stop_for_leverage,
+    format_ratio_pct,
 )
 from hl_bot.strategies.mean_reversion import MeanReversionStrategy
 from hl_bot.strategies.trend import TrendStrategy
@@ -94,6 +95,8 @@ class ScanReport:
     generated_at: str
     symbols: list[SymbolReport]
     skipped: list[str] = field(default_factory=list)
+    # 账户级状态，例如趋势日亏损停开仓；每轮报告都会打印
+    status: list[str] = field(default_factory=list)
 
 
 def _utc_keys(now: datetime | None = None) -> tuple[str, str, int]:
@@ -239,6 +242,7 @@ class BotRunner:
                                     self._execute(intent, now_ms, persist_paper=persist_paper)
                             else:
                                 notes.append(f"金字塔拒绝：{verdict.reason}")
+                                logger.info("%s 金字塔加仓跳过：%s", symbol, verdict.reason)
                         else:
                             notes.append("已有趋势仓，等待金字塔条件或离场（禁止摊平）")
                 else:
@@ -295,6 +299,7 @@ class BotRunner:
                         same_way.append(f"{symbol}:{signal.side.value}")
                 else:
                     notes.append(f"风控拒绝：{verdict.reason}")
+                    logger.info("%s 新开仓跳过：%s", symbol, verdict.reason)
 
             reports.append(
                 SymbolReport(
@@ -312,6 +317,17 @@ class BotRunner:
         if len(same_way) >= 2:
             logger.info("多标的同向信号（高度相关，不额外加风险预算）: %s", ", ".join(same_way))
 
+        status: list[str] = []
+        halt = self.cfg.trend.daily_loss_halt
+        daily_loss = self.account.daily_loss_pct()
+        if halt > 0 and daily_loss >= halt:
+            line = (
+                f"趋势策略：当日亏损已达 {format_ratio_pct(halt)} 上限"
+                f"（当前 {format_ratio_pct(daily_loss)}），停止新开仓与金字塔加仓"
+            )
+            status.append(line)
+            logger.info(line)
+
         if persist_paper:
             self.broker.save()
         return ScanReport(
@@ -321,6 +337,7 @@ class BotRunner:
             generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             symbols=reports,
             skipped=skipped,
+            status=status,
         )
 
     def _cached_equity(self, now_ms: int) -> tuple[float, float] | None:
@@ -1382,8 +1399,10 @@ def format_report(report: ScanReport) -> str:
         "=" * 88,
         f"Hyperliquid 策略扫描  [{mode}]  网络={report.network}  时间={report.generated_at}",
         f"账户权益: ${report.equity:,.2f}    标的: {', '.join(s.symbol for s in report.symbols)}",
-        "=" * 88,
     ]
+    for line in report.status:
+        lines.append(f"  {line}")
+    lines.append("=" * 88)
     for item in report.symbols:
         d = item.decision
         ema_part = ""

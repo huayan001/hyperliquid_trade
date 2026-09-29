@@ -79,6 +79,8 @@ class TrendConfig:
     portfolio_risk_max: float = 0.06
     daily_loss_delever: float = 0.05
     weekly_loss_delever: float = 0.10
+    # 0 = 关闭。>0 时当日亏损达到该比例则拒绝新开仓和金字塔加仓；已有仓的止损、移动止损、离场不受影响。
+    daily_loss_halt: float = 0.0
     funding_annual_warn: float = 0.50
     funding_size_mult: float = 0.5
     # 趋势默认不因资金费飙升自动离场；若手动打开，用独立且更高的离场阈值
@@ -265,6 +267,7 @@ def load_config(
             portfolio_risk_max=_as_float(trend_raw.get("portfolio_risk_max"), 0.06),
             daily_loss_delever=_as_float(trend_raw.get("daily_loss_delever"), 0.05),
             weekly_loss_delever=_as_float(trend_raw.get("weekly_loss_delever"), 0.10),
+            daily_loss_halt=_as_float(trend_raw.get("daily_loss_halt"), 0.0),
             funding_annual_warn=_as_float(trend_raw.get("funding_annual_warn"), 0.50),
             funding_size_mult=_as_float(trend_raw.get("funding_size_mult"), 0.5),
             funding_exit_enabled=_as_bool(trend_raw.get("funding_exit_enabled"), False),

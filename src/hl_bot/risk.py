@@ -32,6 +32,16 @@ class RiskDecision:
     adjusted_stop: float | None = None
 
 
+def format_ratio_pct(value: float) -> str:
+    """把 0.03 格式化成 3%，把 0.035 格式化成 3.5%。"""
+    pct = float(value) * 100.0
+    rounded = round(pct)
+    if abs(pct - rounded) < 1e-9:
+        return f"{int(rounded)}%"
+    text = f"{pct:.2f}".rstrip("0").rstrip(".")
+    return f"{text}%"
+
+
 def approx_liq_stop_pct(leverage: int, buffer_frac: float) -> float:
     """估算「止损相对入场的最大安全距离」：约为 (1/lev)×buffer。
 
@@ -134,6 +144,15 @@ class RiskManager:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
 
+    def trend_daily_halt_hit(self, account: AccountState) -> bool:
+        """趋势日亏损停开仓。halt<=0 表示关闭，已有的 5% 降杠杆逻辑不受影响。"""
+        halt = self.cfg.trend.daily_loss_halt
+        return halt > 0 and account.daily_loss_pct() >= halt
+
+    def trend_daily_halt_reason(self, action: str) -> str:
+        halt = format_ratio_pct(self.cfg.trend.daily_loss_halt)
+        return f"趋势策略：当日亏损已达 {halt} 上限，{action}"
+
     def leverage_scale(self, account: AccountState, strategy: StrategyName) -> float:
         """日/周回撤触发趋势策略降杠杆（仓位等比例缩小）。"""
         scale = 1.0
@@ -176,6 +195,8 @@ class RiskManager:
                 return RiskDecision(False, "均值回归同时持仓数已满")
             risk_pct = self.cfg.mean_reversion.risk_pct
         else:
+            if self.trend_daily_halt_hit(account):
+                return RiskDecision(False, self.trend_daily_halt_reason("停止新开仓"))
             open_tr = [p for p in account.open_positions() if p.strategy is StrategyName.TREND]
             if len(open_tr) >= self.cfg.trend.max_positions:
                 return RiskDecision(False, "趋势策略同时持仓数已满")
@@ -361,6 +382,8 @@ class RiskManager:
         account: AccountState,
     ) -> RiskDecision:
         """允许符合条件的趋势金字塔；拒绝浮亏摊平，且加仓后账户止损风险不得上升。"""
+        if self.trend_daily_halt_hit(account):
+            return RiskDecision(False, self.trend_daily_halt_reason("停止金字塔加仓"))
         if not self.cfg.trend.pyramid_enabled:
             return RiskDecision(False, "金字塔加仓已关闭")
         if position.symbol != signal.symbol or position.side is not signal.side:
