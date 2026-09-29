@@ -18,8 +18,11 @@ state/candles/
 .vscode/
 *.log
 
-# Backtest downloads and pickled run output
+# Backtest downloads and pickled run output (including backtest/short/)
 backtest/data/
 backtest/data_long/
+backtest/**/data/
+backtest/**/data_long/
 backtest/results*.pkl
+backtest/**/*.pkl
 backtest/__pycache__/
