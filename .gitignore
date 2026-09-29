@@ -20,4 +20,6 @@ state/candles/
 
 # Backtest downloads and pickled run output
 backtest/data/
-backtest/results.pkl
+backtest/data_long/
+backtest/results*.pkl
+backtest/__pycache__/
