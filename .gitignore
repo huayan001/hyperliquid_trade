@@ -17,3 +17,7 @@ state/candles/
 .idea/
 .vscode/
 *.log
+
+# Backtest downloads and pickled run output
+backtest/data/
+backtest/results.pkl
