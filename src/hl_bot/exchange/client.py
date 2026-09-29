@@ -1,0 +1,1410 @@
+"""Hyperliquid 行情 / 交易封装。公开数据走官方 /info；实盘下单走官方 Python SDK。"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+from hl_bot.config import BotConfig
+from hl_bot.exchange.candle_cache import OVERLAP_BARS, CandleCache, merge_closed
+from hl_bot.exchange.equity import combine_live_equity
+from hl_bot.exchange.throttle import (
+    RequestThrottle,
+    ScanBudget,
+    exchange_weight_from_payload,
+    info_weight,
+)
+from hl_bot.models import (
+    Candle,
+    FundingInfo,
+    IntentAction,
+    MarketSnapshot,
+    OrderIntent,
+    OrderKind,
+    Side,
+)
+
+logger = logging.getLogger(__name__)
+
+INTERVAL_MS = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "8h": 28_800_000,
+    "12h": 43_200_000,
+    "1d": 86_400_000,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class OrderFill:
+    size: float
+    price: float | None = None
+
+
+def _as_positive_float(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if parsed > 0 else 0.0
+
+
+def _collect_statuses(result: dict[str, Any]) -> list[Any]:
+    statuses: list[Any] = []
+    response = result.get("response")
+    if isinstance(response, dict):
+        data = response.get("data")
+        if isinstance(data, dict) and isinstance(data.get("statuses"), list):
+            statuses.extend(data["statuses"])
+        elif isinstance(data, list):
+            statuses.extend(data)
+    if isinstance(result.get("statuses"), list):
+        statuses.extend(result["statuses"])
+    return statuses
+
+
+def extract_order_fill(result: Any) -> OrderFill | None:
+    """从 Hyperliquid SDK 返回值提取已成交数量。None / 无成交 / 仅 resting / error 视为未成交。"""
+    if result is None or not isinstance(result, dict):
+        return None
+    status = str(result.get("status") or "").lower()
+    if status in {"error", "err", "dry_run"}:
+        return None
+
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        inner = extract_order_fill(nested)
+        if inner is not None:
+            return inner
+
+    filled_sz = 0.0
+    px_num = 0.0
+    px_den = 0.0
+    for item in _collect_statuses(result):
+        if not isinstance(item, dict):
+            continue
+        if item.get("error"):
+            continue
+        filled = item.get("filled")
+        if not isinstance(filled, dict):
+            if "totalSz" in item or "sz" in item:
+                filled = item
+            else:
+                continue
+        sz = _as_positive_float(filled.get("totalSz") or filled.get("sz"))
+        if sz <= 0:
+            continue
+        filled_sz += sz
+        px = _as_positive_float(filled.get("avgPx") or filled.get("px"))
+        if px > 0:
+            px_num += px * sz
+            px_den += sz
+
+    if filled_sz <= 0:
+        return None
+    return OrderFill(size=filled_sz, price=(px_num / px_den) if px_den > 0 else None)
+
+
+def collect_error_messages(result: Any) -> list[str]:
+    """收集 SDK /info 下单返回里的 error 文案（含嵌套 order）。"""
+    msgs: list[str] = []
+    if result is None:
+        return msgs
+    if isinstance(result, str):
+        if result.strip():
+            msgs.append(result)
+        return msgs
+    if not isinstance(result, dict):
+        return msgs
+    err = result.get("error")
+    if err:
+        msgs.append(str(err))
+    message = result.get("message")
+    if message:
+        msgs.append(str(message))
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        msgs.extend(collect_error_messages(nested))
+    for item in _collect_statuses(result):
+        if isinstance(item, dict) and item.get("error"):
+            msgs.append(str(item["error"]))
+        elif isinstance(item, str) and item.strip():
+            msgs.append(item)
+    return msgs
+
+
+def is_post_only_reject(result: Any) -> bool:
+    """Alo/post-only 因会立刻吃单被拒。"""
+    for msg in collect_error_messages(result):
+        low = msg.lower()
+        if "post only" in low or "post-only" in low or "alonotallowed" in low:
+            return True
+    return False
+
+
+def extract_resting_oids(result: Any) -> list[int]:
+    """入场单 resting oid；不把同批 stop 的 oid 算进来。"""
+    if result is None or not isinstance(result, dict):
+        return []
+    found: list[int] = []
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        found.extend(extract_resting_oids(nested))
+    for item in _collect_statuses(result):
+        if not isinstance(item, dict):
+            continue
+        resting = item.get("resting")
+        if isinstance(resting, dict) and resting.get("oid") is not None:
+            try:
+                found.append(int(resting["oid"]))
+            except (TypeError, ValueError):
+                continue
+    return _unique_oids(found)
+
+
+def extract_oid(result: Any) -> int | None:
+    oids = extract_oids(result)
+    return oids[0] if oids else None
+
+
+def extract_oids(result: Any) -> list[int]:
+    if result is None or not isinstance(result, dict):
+        return []
+    found: list[int] = []
+    nested = result.get("order")
+    if isinstance(nested, dict):
+        found.extend(extract_oids(nested))
+    for item in _collect_statuses(result):
+        if not isinstance(item, dict):
+            continue
+        for key in ("resting", "filled"):
+            blob = item.get(key)
+            if isinstance(blob, dict) and blob.get("oid") is not None:
+                try:
+                    found.append(int(blob["oid"]))
+                except (TypeError, ValueError):
+                    continue
+        if item.get("oid") is not None:
+            try:
+                found.append(int(item["oid"]))
+            except (TypeError, ValueError):
+                continue
+    return _unique_oids(found)
+
+
+def _unique_oids(oids: list[int]) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for oid in oids:
+        if oid in seen:
+            continue
+        seen.add(oid)
+        out.append(oid)
+    return out
+
+
+def protective_stop_size(intent: OrderIntent, filled_size: float) -> float:
+    """保护止损张数 = 当前仓 + 本笔确认成交，绝不用失败加仓的计划 total_size。"""
+    filled = max(0.0, float(filled_size))
+    current = intent.extras.get("current_size")
+    if current is None:
+        planned = intent.extras.get("total_size")
+        if planned is not None and intent.action is IntentAction.ADD:
+            current = max(0.0, float(planned) - float(intent.size))
+        else:
+            current = 0.0
+    else:
+        current = max(0.0, float(current))
+    return current + filled
+
+
+def is_reduce_only_stop_order(order: dict[str, Any], symbol: str) -> bool:
+    """frontendOpenOrders 里该币的 reduce-only 止损（含 trigger / tpsl=sl）。"""
+    coin = str(order.get("coin") or order.get("symbol") or "")
+    if coin.upper() != symbol.upper():
+        return False
+    reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+    is_trigger = bool(order.get("isTrigger") or order.get("is_trigger"))
+    tpsl = str(order.get("tpsl") or "").lower()
+    otype = str(order.get("orderType") or order.get("origType") or order.get("type") or "").lower()
+    stop_like = is_trigger or tpsl == "sl" or "stop" in otype
+    return reduce_only and stop_like
+
+
+class RateLimitError(RuntimeError):
+    """Hyperliquid 429。调用方应退避重试，不得因此退出进程。"""
+
+
+_RATE_LIMIT_ATTEMPTS = 5
+_RATE_LIMIT_BASE_DELAY = 2.0
+_RATE_LIMIT_MAX_DELAY = 60.0
+# SDK Info 路径抛出的 429 没有内置退避；REST 路径由 _post_info 自己重试
+_SDK_INFO_RETRIES = 2
+
+
+def is_rate_limit_error(exc: BaseException | None) -> bool:
+    """识别 HTTP / SDK ClientError 429，含异常链。"""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RateLimitError):
+            return True
+        if getattr(current, "status_code", None) == 429 or getattr(current, "code", None) == 429:
+            return True
+        text = str(current).lstrip()
+        if text.startswith("(429,") or text.startswith("(429 ") or "HTTP 429" in text:
+            return True
+        nxt = current.__cause__ if current.__cause__ is not None else current.__context__
+        current = nxt if nxt is not current else None
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class LiveEquityRead:
+    """一次实盘权益读取结果；complete=False 时 equity 只是部分值，不可直接当权益用。"""
+
+    equity: float
+    complete: bool
+    formula: str
+    abstraction: str | None
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangePosition:
+    symbol: str
+    size: float
+    side: Side
+    entry_price: float
+    leverage: int | None = None
+    liquidation_px: float | None = None
+    margin_used: float | None = None
+
+
+def _parse_leverage_value(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        raw = raw.get("value")
+    try:
+        lev = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return lev if lev > 0 else None
+
+
+def parse_perp_positions(raw: Any) -> dict[str, ExchangePosition]:
+    """clearinghouseState.assetPositions → 绝对张数。szi>0 为多。"""
+    if not isinstance(raw, dict):
+        return {}
+    rows = raw.get("assetPositions")
+    if not isinstance(rows, list):
+        return {}
+    out: dict[str, ExchangePosition] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        pos = item.get("position") if isinstance(item.get("position"), dict) else item
+        if not isinstance(pos, dict):
+            continue
+        coin = str(pos.get("coin") or pos.get("symbol") or "")
+        try:
+            szi = float(pos.get("szi") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not coin or abs(szi) <= 1e-12:
+            continue
+        try:
+            entry = float(pos.get("entryPx") or pos.get("entry_price") or 0.0)
+        except (TypeError, ValueError):
+            entry = 0.0
+        try:
+            liq = float(pos.get("liquidationPx") or pos.get("liquidation_px") or 0.0)
+        except (TypeError, ValueError):
+            liq = 0.0
+        try:
+            margin = float(pos.get("marginUsed") or pos.get("margin_used") or 0.0)
+        except (TypeError, ValueError):
+            margin = 0.0
+        out[coin] = ExchangePosition(
+            symbol=coin,
+            size=abs(szi),
+            side=Side.LONG if szi > 0 else Side.SHORT,
+            entry_price=entry,
+            leverage=_parse_leverage_value(pos.get("leverage")),
+            liquidation_px=liq if liq > 0 else None,
+            margin_used=margin if margin > 0 else None,
+        )
+    return out
+
+
+def normalize_px(px: float) -> float:
+    return float(f"{float(px):.5g}")
+
+
+def prices_close(left: float, right: float) -> bool:
+    if left <= 0 or right <= 0:
+        return False
+    if normalize_px(left) == normalize_px(right):
+        return True
+    return abs(left - right) / max(abs(right), 1e-12) <= 0.001
+
+
+def sizes_close(actual: float, target: float, decimals: int = 4) -> bool:
+    """张数近似相等：一个数量步进，或目标的 2%（取较大者）。"""
+    if target <= 0 or actual <= 0:
+        return False
+    step = 10 ** (-max(int(decimals), 0))
+    tol = max(step, abs(target) * 0.02)
+    return abs(actual - target) <= tol + 1e-9
+
+
+def order_oid(order: dict[str, Any]) -> int | None:
+    raw = order.get("oid")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def order_size(order: dict[str, Any]) -> float:
+    for key in ("sz", "szi", "origSz", "size"):
+        val = _as_positive_float(order.get(key))
+        if val > 0:
+            return val
+    return 0.0
+
+
+def order_trigger_px(order: dict[str, Any]) -> float:
+    for key in ("triggerPx", "trigger_px", "limitPx", "px"):
+        val = _as_positive_float(order.get(key))
+        if val > 0:
+            return val
+    return 0.0
+
+
+def order_limit_px(order: dict[str, Any]) -> float:
+    for key in ("limitPx", "px", "limit_px"):
+        val = _as_positive_float(order.get(key))
+        if val > 0:
+            return val
+    return 0.0
+
+
+def order_is_buy(order: dict[str, Any]) -> bool | None:
+    side = order.get("side")
+    if side is not None:
+        token = str(side).strip().upper()
+        if token in {"B", "BUY", "BID"}:
+            return True
+        if token in {"A", "SELL", "ASK"}:
+            return False
+    if "isBuy" in order:
+        return bool(order.get("isBuy"))
+    if "is_buy" in order:
+        return bool(order.get("is_buy"))
+    return None
+
+
+def is_open_entry_order(order: dict[str, Any], symbol: str) -> bool:
+    """非 reduce-only 的入场/加仓挂单。保护止损不算。"""
+    coin = str(order.get("coin") or order.get("symbol") or "")
+    if coin.upper() != symbol.upper():
+        return False
+    if bool(order.get("reduceOnly") or order.get("reduce_only")):
+        return False
+    if is_reduce_only_stop_order(order, symbol):
+        return False
+    return True
+
+
+def same_resting_entry(order: dict[str, Any], *, symbol: str, is_buy: bool, price: float) -> bool:
+    if not is_open_entry_order(order, symbol):
+        return False
+    buy = order_is_buy(order)
+    if buy is None or buy is not is_buy:
+        return False
+    px = order_limit_px(order)
+    if px <= 0:
+        return False
+    return prices_close(px, price)
+
+
+def candle_from_hl(raw: dict[str, Any]) -> Candle:
+    return Candle(
+        ts=int(raw["t"]),
+        end_ts=int(raw["T"]),
+        open=float(raw["o"]),
+        high=float(raw["h"]),
+        low=float(raw["l"]),
+        close=float(raw["c"]),
+        volume=float(raw.get("v") or 0.0),
+    )
+
+
+def short_errors(errors: list[str] | tuple[str, ...]) -> list[str]:
+    """错误摘要：只保留来源标签与是否 429，不打印整段响应头。"""
+    out: list[str] = []
+    for err in errors:
+        label = str(err).split(":", 1)[0]
+        out.append(f"{label} 429" if _message_is_rate_limit(str(err)) else f"{label} 失败")
+    return out
+
+
+def _message_is_rate_limit(message: str) -> bool:
+    text = str(message or "")
+    if is_rate_limit_error(RuntimeError(text)):
+        return True
+    low = text.lower()
+    return "429" in text or "rate limit" in low or "too many requests" in low
+
+
+@dataclass(slots=True)
+class AccountSnapshot:
+    """一轮扫描里共享的账户读数。perps_raw 同时给权益和持仓用，避免再打一次 clearinghouseState。"""
+
+    perps_raw: Any = None
+    spot_raw: Any = None
+    perps_error: str | None = None
+    spot_error: str | None = None
+
+
+class HyperliquidClient:
+    def __init__(self, cfg: BotConfig) -> None:
+        self.cfg = cfg
+        self.base_url = cfg.api_url.rstrip("/")
+        self._info = None
+        # 最近一次成功读到的账户模式（unifiedAccount 等），userAbstraction 429 时沿用
+        self.last_abstraction: str | None = None
+        self._exchange = None
+        self._sdk_ready = False
+        self._perp_meta: Any = None
+        self._spot_meta: Any = None
+        # sleep 走本模块的 time.sleep，测试里打补丁时节流也会跟着停住
+        self.throttle = RequestThrottle(sleep=lambda seconds: time.sleep(seconds))
+        self.budget = ScanBudget()
+        self.candle_cache = CandleCache(Path(cfg.state_path).parent / "candles")
+        self._share_book = False
+        self.shared_perps_raw: Any = None
+        self.shared_open_orders: list[dict[str, Any]] | None = None
+        self._perps_rate_limited = False
+        self._perps_rate_limit_message = ""
+
+    def begin_scan(self) -> None:
+        """一轮扫描开始：清空共享快照，并重置请求计数。"""
+        self._share_book = True
+        self.shared_perps_raw = None
+        self.shared_open_orders = None
+        self._perps_rate_limited = False
+        self._perps_rate_limit_message = ""
+        self.budget.begin()
+
+    def end_scan(self) -> None:
+        try:
+            self.budget.log()
+        finally:
+            self._share_book = False
+            self.shared_perps_raw = None
+            self.shared_open_orders = None
+            self._perps_rate_limited = False
+            self._perps_rate_limit_message = ""
+
+    def _post_info(self, payload: dict[str, Any]) -> Any:
+        delay = _RATE_LIMIT_BASE_DELAY
+        last_error: BaseException | None = None
+        name = str(payload.get("type") or "info")
+        for attempt in range(1, _RATE_LIMIT_ATTEMPTS + 1):
+            estimate = info_weight(payload)
+            self.throttle.acquire_info(estimate)
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/info",
+                data=data,
+                headers={"Content-Type": "application/json", "User-Agent": "hl-bot/0.1"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                last_error = exc
+                if exc.code == 429:
+                    self.budget.record(name, estimate, rate_limited=True)
+                    if attempt < _RATE_LIMIT_ATTEMPTS:
+                        logger.warning("/info 429，%.1fs 后重试", delay)
+                        time.sleep(delay)
+                        delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+                        continue
+                    raise RateLimitError(f"Hyperliquid /info HTTP 429: {body}") from exc
+                raise RuntimeError(f"Hyperliquid /info HTTP {exc.code}: {body}") from exc
+            actual = info_weight(payload, raw)
+            self.throttle.adjust_info(actual - estimate)
+            self.budget.record(name, actual)
+            return raw
+        raise RateLimitError("Hyperliquid /info HTTP 429") from last_error
+
+    def _call_rate_limited(self, fn: Any, *, label: str) -> Any:
+        """SDK Info/Exchange 构造里的 meta 请求也会 429；退避后重试，耗尽则抛 RateLimitError。"""
+        delay = _RATE_LIMIT_BASE_DELAY
+        last_error: BaseException | None = None
+        for attempt in range(1, _RATE_LIMIT_ATTEMPTS + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                if not is_rate_limit_error(exc):
+                    raise
+                last_error = exc
+                if attempt >= _RATE_LIMIT_ATTEMPTS:
+                    break
+                logger.warning("%s 429，%.1fs 后重试", label, delay)
+                time.sleep(delay)
+                delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+        raise RateLimitError(f"{label} 持续 429") from last_error
+
+    def _build_info(self, url: str) -> Any:
+        from hyperliquid.info import Info
+
+        # 先走已节流的 REST，把 meta 传进 SDK，避免构造函数里再打两轮未计数的 /info
+        meta = self._post_info({"type": "meta"})
+        spot_meta = self._post_info({"type": "spotMeta"})
+        self._perp_meta = meta
+        self._spot_meta = spot_meta
+        info = Info(url, skip_ws=True, meta=meta, spot_meta=spot_meta)
+        self._install_info_throttle(info)
+        return info
+
+    def _build_exchange(self, url: str, account: Any, address: str) -> Any:
+        from hyperliquid.exchange import Exchange
+
+        exchange = Exchange(
+            account,
+            url,
+            meta=self._perp_meta,
+            account_address=address,
+            spot_meta=self._spot_meta,
+        )
+        self._install_info_throttle(exchange.info)
+        self._install_exchange_throttle(exchange)
+        return exchange
+
+    def _install_info_throttle(self, info: Any) -> None:
+        if getattr(info, "_hl_info_throttled", False):
+            return
+        original = info.post
+
+        def wrapped(url_path: str, payload: Any = None) -> Any:
+            if not str(url_path).endswith("/info") or not isinstance(payload, dict):
+                return original(url_path, payload)
+            name = str(payload.get("type") or "info")
+            estimate = info_weight(payload)
+            self.throttle.acquire_info(estimate)
+            try:
+                raw = original(url_path, payload)
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    self.budget.record(name, estimate, rate_limited=True)
+                raise
+            actual = info_weight(payload, raw)
+            self.throttle.adjust_info(actual - estimate)
+            self.budget.record(name, actual)
+            return raw
+
+        info.post = wrapped
+        info._hl_info_throttled = True
+
+    def _install_exchange_throttle(self, exchange: Any) -> None:
+        if getattr(exchange, "_hl_exchange_throttled", False):
+            return
+        original = exchange.post
+
+        def wrapped(url_path: str, payload: Any = None) -> Any:
+            if not str(url_path).endswith("/exchange"):
+                return original(url_path, payload)
+            weight = exchange_weight_from_payload(payload)
+            self.throttle.acquire_exchange(weight)
+            try:
+                raw = original(url_path, payload)
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    self.budget.record("exchange", weight, kind="exchange", rate_limited=True)
+                raise
+            self.budget.record("exchange", weight, kind="exchange")
+            return raw
+
+        exchange.post = wrapped
+        exchange._hl_exchange_throttled = True
+
+    def connect_sdk(self, *, for_trading: bool = False) -> None:
+        if self._sdk_ready and (self._exchange is not None or not for_trading):
+            return
+        try:
+            from hyperliquid.info import Info  # noqa: F401
+            from hyperliquid.utils import constants
+        except ImportError as exc:  # pragma: no cover
+            if for_trading:
+                raise RuntimeError("实盘需要安装 hyperliquid-python-sdk") from exc
+            logger.warning("未安装官方 SDK，公开行情改用 REST /info")
+            return
+
+        url = constants.TESTNET_API_URL if self.cfg.network == "testnet" else constants.MAINNET_API_URL
+        if self._info is None:
+            self._info = self._call_rate_limited(lambda: self._build_info(url), label="Info")
+        if for_trading and self._exchange is None:
+            self.cfg.require_live_ready()
+            import eth_account
+
+            account = eth_account.Account.from_key(self.cfg.private_key)
+            address = self.cfg.account_address or account.address
+            self._exchange = self._call_rate_limited(
+                lambda: self._build_exchange(url, account, address),
+                label="Exchange",
+            )
+            logger.info("已连接 Exchange，账户 %s（网络 %s）", address, self.cfg.network)
+        self._sdk_ready = True
+
+    def _post_candles(self, symbol: str, interval: str, start_ms: int, end_ms: int) -> list[Any]:
+        raw = self._post_info(
+            {
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": symbol,
+                    "interval": interval,
+                    "startTime": int(start_ms),
+                    "endTime": int(end_ms),
+                },
+            }
+        )
+        if not isinstance(raw, list):
+            raise RuntimeError(f"candleSnapshot 返回不是列表: {symbol} {interval}")
+        return raw
+
+    def fetch_candles(self, symbol: str, interval: str, count: int = 120) -> list[Candle]:
+        now = int(time.time() * 1000)
+        interval_ms = INTERVAL_MS[interval]
+        loaded = self.candle_cache.load(symbol, interval, interval_ms)
+        if loaded is not None:
+            cached, exhaustive = loaded
+            if len(cached) >= count or exhaustive:
+                start = cached[-1].ts - OVERLAP_BARS * interval_ms
+                try:
+                    fresh_raw = self._post_candles(symbol, interval, start, now)
+                    fresh = [candle_from_hl(item) for item in fresh_raw]
+                    merged = merge_closed(cached, fresh, interval_ms=interval_ms, now_ms=now)
+                except RateLimitError:
+                    raise
+                except (KeyError, TypeError, ValueError, RuntimeError):
+                    merged = None
+                if merged is not None:
+                    result = merged[-count:]
+                    self.candle_cache.save(
+                        symbol,
+                        interval,
+                        interval_ms,
+                        result,
+                        exhaustive=len(merged) < count,
+                    )
+                    self.budget.candle_incremental += 1
+                    return result
+                logger.info("K 线缓存有缺口或增量失败，全量回退 %s %s", symbol, interval)
+        span = interval_ms * (count + 2)
+        raw = self._post_candles(symbol, interval, now - span, now)
+        closed = [candle_from_hl(item) for item in raw]
+        closed.sort(key=lambda c: c.ts)
+        closed = [c for c in closed if c.end_ts < now]
+        result = closed[-count:]
+        if result:
+            self.candle_cache.save(
+                symbol,
+                interval,
+                interval_ms,
+                result,
+                exhaustive=len(closed) < count,
+            )
+        self.budget.candle_full += 1
+        return result
+
+    def fetch_mids(self) -> dict[str, float]:
+        raw = self._post_info({"type": "allMids"})
+        return {str(k): float(v) for k, v in raw.items()}
+
+    def fetch_asset_contexts(self) -> dict[str, dict[str, Any]]:
+        raw = self._post_info({"type": "metaAndAssetCtxs"})
+        universe = raw[0]["universe"]
+        ctxs = raw[1]
+        out: dict[str, dict[str, Any]] = {}
+        for meta, ctx in zip(universe, ctxs):
+            name = str(meta["name"])
+            out[name] = {
+                "funding": float(ctx.get("funding") or 0.0),
+                "mark_px": float(ctx.get("markPx") or ctx.get("midPx") or 0.0),
+                "mid_px": float(ctx.get("midPx") or ctx.get("markPx") or 0.0),
+                "max_leverage": int(meta.get("maxLeverage") or 10),
+                "only_isolated": bool(meta.get("onlyIsolated") or False),
+                "sz_decimals": int(meta.get("szDecimals") or 4),
+            }
+        return out
+
+    def fetch_funding_history(self, symbol: str, hours: int = 24) -> list[dict[str, Any]]:
+        now = int(time.time() * 1000)
+        raw = self._post_info(
+            {
+                "type": "fundingHistory",
+                "coin": symbol,
+                "startTime": now - hours * 3_600_000,
+                "endTime": now,
+            }
+        )
+        return list(raw or [])
+
+    def funding_info(self, symbol: str, current_hourly: float) -> FundingInfo:
+        hist = self.fetch_funding_history(symbol, 24)
+        rates = [float(x.get("fundingRate") or 0.0) for x in hist]
+        avg = sum(rates) / len(rates) if rates else current_hourly
+        return FundingInfo(hourly_rate=current_hourly, avg_24h=avg)
+
+    def load_market(self, symbol: str, ctx: dict[str, Any] | None = None, mid: float | None = None) -> MarketSnapshot:
+        ctxs = {symbol: ctx} if ctx else self.fetch_asset_contexts()
+        info = ctxs.get(symbol) or {}
+        mids = {} if mid is not None else self.fetch_mids()
+        px = mid if mid is not None else float(mids.get(symbol) or info.get("mid_px") or 0.0)
+        daily = self.fetch_candles(symbol, "1d", 120)
+        h4 = self.fetch_candles(symbol, "4h", 80)
+        h1 = self.fetch_candles(symbol, "1h", 120)
+        funding = self.funding_info(symbol, float(info.get("funding") or 0.0))
+        return MarketSnapshot(
+            symbol=symbol,
+            mid=px,
+            daily=tuple(daily),
+            h4=tuple(h4),
+            h1=tuple(h1),
+            funding=funding,
+            max_leverage=int(info.get("max_leverage") or self.cfg.max_leverage_for(symbol)),
+        )
+
+    def _fetch_info(self, payload: dict[str, Any]) -> Any:
+        """公开 /info；调用方若已 connect_sdk，优先走官方 SDK。"""
+        info_type = str(payload.get("type") or "")
+        if self._info is not None:
+            if info_type == "clearinghouseState" and hasattr(self._info, "user_state"):
+                return self._info.user_state(payload["user"])
+            if info_type == "spotClearinghouseState" and hasattr(self._info, "spot_user_state"):
+                return self._info.spot_user_state(payload["user"])
+        return self._post_info(payload)
+
+    def _safe_info(
+        self,
+        payload: dict[str, Any],
+        *,
+        label: str,
+        retries: int = _SDK_INFO_RETRIES,
+    ) -> tuple[Any, str | None]:
+        """读 /info；SDK 路径的 429 不走 _post_info 的退避，这里补几次短重试。"""
+        delay = _RATE_LIMIT_BASE_DELAY
+        attempt = 0
+        while True:
+            try:
+                return self._fetch_info(payload), None
+            except Exception as exc:
+                # 仅 SDK 路径补重试；REST 路径（RateLimitError）已在 _post_info 内重试耗尽，不再叠加
+                if (
+                    attempt < retries
+                    and self._info is not None
+                    and is_rate_limit_error(exc)
+                    and not isinstance(exc, RateLimitError)
+                ):
+                    attempt += 1
+                    logger.warning("读取%s遇到 429，%.1fs 后重试 (%d/%d)", label, delay, attempt, retries)
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+                    continue
+                logger.warning("读取%s失败: %s", label, exc)
+                return None, f"{label}: {exc}"
+
+    def fetch_account_snapshot(self) -> AccountSnapshot:
+        """每轮扫描读一次 perps + spot。成功的 perps 原文留给持仓解析复用。"""
+        if self.cfg.dry_run or not self.cfg.account_address:
+            return AccountSnapshot()
+        try:
+            self.connect_sdk(for_trading=False)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("connect_sdk 跳过，改走 REST /info: %s", exc)
+        address = self.cfg.account_address
+        perps_raw, perps_err = self._safe_info(
+            {"type": "clearinghouseState", "user": address},
+            label="perps clearinghouseState",
+        )
+        spot_raw, spot_err = self._safe_info(
+            {"type": "spotClearinghouseState", "user": address},
+            label="spotClearinghouseState",
+        )
+        if perps_err and _message_is_rate_limit(perps_err):
+            self._perps_rate_limited = True
+            self._perps_rate_limit_message = perps_err
+        elif self._share_book and isinstance(perps_raw, dict):
+            self.shared_perps_raw = perps_raw
+        return AccountSnapshot(
+            perps_raw=perps_raw,
+            spot_raw=spot_raw,
+            perps_error=perps_err,
+            spot_error=spot_err,
+        )
+
+    def read_live_equity(self, snapshot: AccountSnapshot | None = None) -> LiveEquityRead | None:
+        """读取实盘权益并标明是否「完整」。
+
+        complete=False 表示 perps / spot 任一侧读取失败，或需要账户模式去重却读不到模式且无缓存；
+        此时 equity 只是部分值（例如 2026-09-29 03:25 现货 429 → 只剩 perps $36.25），
+        调用方不应把它当真实权益。dry-run / 无地址返回 None。
+        传入本轮 AccountSnapshot 时不再重复请求 clearinghouseState / spotClearinghouseState。
+        """
+        if self.cfg.dry_run or not self.cfg.account_address:
+            return None
+
+        try:
+            self.connect_sdk(for_trading=False)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("connect_sdk 跳过，改走 REST /info: %s", exc)
+
+        address = self.cfg.account_address
+        errors: list[str] = []
+        if snapshot is None:
+            perps_raw, perps_err = self._safe_info(
+                {"type": "clearinghouseState", "user": address},
+                label="perps clearinghouseState",
+            )
+            spot_raw, spot_err = self._safe_info(
+                {"type": "spotClearinghouseState", "user": address},
+                label="spotClearinghouseState",
+            )
+        else:
+            perps_raw, perps_err = snapshot.perps_raw, snapshot.perps_error
+            spot_raw, spot_err = snapshot.spot_raw, snapshot.spot_error
+        if perps_err:
+            errors.append(perps_err)
+        if spot_err:
+            errors.append(spot_err)
+
+        if perps_raw is None and spot_raw is None:
+            return LiveEquityRead(
+                equity=0.0,
+                complete=False,
+                formula="none",
+                abstraction=None,
+                errors=tuple(errors),
+            )
+
+        complete = perps_raw is not None and spot_raw is not None
+        abstraction = None
+        # 仅当两侧都有正数时才需要模式，用来避免 unified 下同一桶 USDC 加两次
+        preview = combine_live_equity(perps_raw, spot_raw, None)
+        if preview.perps_value > 0 and preview.free_spot_usdc > 0 and self.last_abstraction:
+            # 账户模式几乎不变：有缓存就直接用，少打一次 /info（共享 IP 常 429）
+            abstraction = self.last_abstraction
+        elif preview.perps_value > 0 and preview.free_spot_usdc > 0:
+            abstraction, abs_err = self._safe_info(
+                {"type": "userAbstraction", "user": address},
+                label="userAbstraction",
+            )
+            if abs_err:
+                if self.last_abstraction:
+                    abstraction = self.last_abstraction
+                    logger.info("未读到账户模式，沿用上次成功读取的模式 %s: %s", abstraction, abs_err)
+                else:
+                    complete = False
+                    errors.append(abs_err)
+                    logger.info("未读到账户模式且无缓存，按标准账户相加 perps+现货（标记为不完整）: %s", abs_err)
+            elif abstraction:
+                self.last_abstraction = str(abstraction)
+
+        breakdown = combine_live_equity(perps_raw, spot_raw, abstraction)
+        if complete:
+            logger.info(
+                "实盘权益 $%.2f [%s] 计入=%s perps=$%.2f 可用现货USDC=$%.2f abstraction=%s",
+                breakdown.equity,
+                breakdown.formula,
+                ",".join(breakdown.included) or "none",
+                breakdown.perps_value,
+                breakdown.free_spot_usdc,
+                breakdown.abstraction or "unknown",
+            )
+        else:
+            # 部分读数不打印金额，避免被误当成权益（曾出现现货 429 时显示 $32–38）
+            logger.info("实盘权益读取不完整（%s），本次读数不采用", "; ".join(short_errors(errors)) or "-")
+        logger.debug(
+            "权益明细 formula=%s perps=%s spot=%s abstraction=%s errors=%s",
+            breakdown.formula,
+            breakdown.perps_value,
+            breakdown.free_spot_usdc,
+            breakdown.abstraction,
+            errors or None,
+        )
+        return LiveEquityRead(
+            equity=breakdown.equity,
+            complete=complete,
+            formula=breakdown.formula,
+            abstraction=breakdown.abstraction,
+            errors=tuple(errors),
+        )
+
+    def account_equity(self, fallback: float) -> float:
+        """实盘权益对齐 App「可用」：perps accountValue + 可用现货 USDC（按账户模式去重）。
+
+        dry-run / 无地址时原样返回 fallback，纸盘路径不变。
+        兼容旧接口：两侧都失败或结果为 0 且有失败则回退 fallback。
+        实盘循环请用 read_live_equity() + BotRunner 的缓存/可疑读数判断。
+        """
+        reading = self.read_live_equity()
+        if reading is None:
+            return fallback
+        if reading.equity <= 0 and reading.errors:
+            logger.warning("读取账户权益失败，回退模拟权益: %s", "; ".join(reading.errors))
+            return fallback
+        return reading.equity
+
+    def round_size(self, symbol: str, size: float, sz_decimals: int | None = None) -> float:
+        dec = sz_decimals if sz_decimals is not None else 4
+        factor = 10**dec
+        return math_floor(size, factor)
+
+    def round_size_cover(self, symbol: str, size: float, sz_decimals: int | None = None) -> float:
+        """保护止损张数：向上取整到 sz 精度，避免 floor 后小于持仓留下裸露。"""
+        dec = sz_decimals if sz_decimals is not None else 4
+        factor = 10**dec
+        return math_ceil(size, factor)
+
+    def update_leverage(self, symbol: str, leverage: int, *, isolated: bool = True) -> Any:
+        """实盘改杠杆；dry-run / 无 exchange 时跳过。"""
+        if self.cfg.dry_run or self._exchange is None:
+            return {"status": "dry_run"}
+        lev = max(1, int(leverage))
+        return self._exchange.update_leverage(lev, symbol, is_cross=not isolated)
+
+    def fetch_open_orders(self) -> list[dict[str, Any]]:
+        """当前账户挂单（含 trigger 止损）。无地址时返回空列表。
+
+        同一轮扫描里第一次读取后复用，撤单后作废。
+        """
+        address = self.cfg.account_address
+        if not address:
+            return []
+        if self._share_book and self.shared_open_orders is not None:
+            return [dict(row) for row in self.shared_open_orders]
+        orders = self._load_open_orders(address)
+        if self._share_book:
+            self.shared_open_orders = list(orders)
+        return [dict(row) for row in orders]
+
+    def _load_open_orders(self, address: str) -> list[dict[str, Any]]:
+        if self._info is not None and hasattr(self._info, "frontend_open_orders"):
+            try:
+                raw = self._info.frontend_open_orders(address)
+                if isinstance(raw, list):
+                    return raw
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    logger.warning("SDK frontend_open_orders 429，改 REST /info: %s", exc)
+                else:
+                    logger.debug("SDK frontend_open_orders 失败，改 REST: %s", exc)
+        raw = self._post_info({"type": "frontendOpenOrders", "user": address})
+        return list(raw or [])
+
+    def fetch_perp_positions(self) -> dict[str, ExchangePosition]:
+        """永续持仓。无地址时返回空。429 向上抛，由扫描循环退避。
+
+        本轮已经成功读过 clearinghouseState 时直接解析那一份，不再请求。
+        """
+        address = self.cfg.account_address
+        if not address:
+            return {}
+        if self._perps_rate_limited:
+            raise RateLimitError(self._perps_rate_limit_message or "clearinghouseState 429")
+        if self._share_book and isinstance(self.shared_perps_raw, dict):
+            return parse_perp_positions(self.shared_perps_raw)
+        raw = self._load_perp_state(address)
+        if self._share_book and isinstance(raw, dict):
+            self.shared_perps_raw = raw
+        return parse_perp_positions(raw)
+
+    def fetch_user_fills_by_time(self, start_ms: int, end_ms: int | None = None) -> list[dict[str, Any]]:
+        """账户成交（userFillsByTime）。无地址返回空；429 向上抛。"""
+        address = self.cfg.account_address
+        if not address:
+            return []
+        payload: dict[str, Any] = {
+            "type": "userFillsByTime",
+            "user": address,
+            "startTime": int(start_ms),
+            "aggregateByTime": True,
+        }
+        if end_ms is not None:
+            payload["endTime"] = int(end_ms)
+        raw = self._post_info(payload)
+        return [row for row in (raw or []) if isinstance(row, dict)]
+
+    def fetch_best_bid_ask(self, symbol: str) -> tuple[float, float] | None:
+        """l2Book 最优买一/卖一；失败返回 None。"""
+        try:
+            raw = self._post_info({"type": "l2Book", "coin": symbol})
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                logger.warning("读取 %s 盘口 429: %s", symbol, exc)
+            else:
+                logger.warning("读取 %s 盘口失败: %s", symbol, exc)
+            return None
+        try:
+            levels = raw["levels"]
+            bid = float(levels[0][0]["px"])
+            ask = float(levels[1][0]["px"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        if bid <= 0 or ask <= 0:
+            return None
+        return bid, ask
+
+    def _load_perp_state(self, address: str) -> Any:
+        if self._info is not None and hasattr(self._info, "user_state"):
+            try:
+                raw = self._info.user_state(address)
+                if isinstance(raw, dict):
+                    return raw
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    logger.warning("SDK user_state 429，改 REST /info: %s", exc)
+                else:
+                    logger.debug("SDK user_state 失败，改 REST: %s", exc)
+        return self._post_info({"type": "clearinghouseState", "user": address})
+
+    def _limit_tif(self, kind: OrderKind) -> str:
+        return "Alo" if kind is OrderKind.MAKER_LIMIT else "Gtc"
+
+    def _submit_entry(
+        self,
+        intent: OrderIntent,
+        *,
+        is_buy: bool,
+        size: float,
+        tif: str | None = None,
+        price: float | None = None,
+    ) -> Any:
+        if intent.kind is OrderKind.MARKET and tif is None:
+            return self._exchange.market_open(intent.symbol, is_buy, size)
+        use_tif = tif or self._limit_tif(intent.kind)
+        px = float(price) if price is not None and price > 0 else float(intent.price)
+        return self._exchange.order(
+            intent.symbol,
+            is_buy,
+            size,
+            float(f"{px:.5g}"),
+            {"limit": {"tif": use_tif}},
+            reduce_only=False,
+        )
+
+    def _cancel_oids(self, symbol: str, oids: list[int]) -> list[int]:
+        cancelled: list[int] = []
+        if self._exchange is None:
+            return cancelled
+        if oids:
+            self.shared_open_orders = None
+        for oid in _unique_oids(oids):
+            try:
+                self._exchange.cancel(symbol, int(oid))
+                cancelled.append(int(oid))
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    raise
+                logger.warning("取消 %s 订单 %s 失败: %s", symbol, oid, exc)
+        return cancelled
+
+    def _cancel_resting_entry(self, symbol: str, result: Any) -> list[int]:
+        oids = extract_resting_oids(result)
+        if not oids:
+            return []
+        logger.warning("%s 入场未成交但仍 resting，撤销以免无保护挂单: oids=%s", symbol, oids)
+        return self._cancel_oids(symbol, oids)
+
+    def reduce_only_stop_oids(self, symbol: str, orders: list[dict[str, Any]] | None = None) -> list[int]:
+        rows = orders if orders is not None else self.fetch_open_orders()
+        oids: list[int] = []
+        for item in rows:
+            if not isinstance(item, dict) or not is_reduce_only_stop_order(item, symbol):
+                continue
+            raw_oid = item.get("oid")
+            if raw_oid is None:
+                continue
+            try:
+                oids.append(int(raw_oid))
+            except (TypeError, ValueError):
+                continue
+        return _unique_oids(oids)
+
+    def cancel_reduce_only_stops(self, symbol: str, extra_oids: list[int] | None = None) -> list[int]:
+        """撤掉该币已有 reduce-only 止损，避免重复堆积。查询失败时仍尝试 extras 里的 oid。"""
+        oids = list(extra_oids or [])
+        try:
+            oids.extend(self.reduce_only_stop_oids(symbol))
+        except Exception as exc:
+            logger.warning("查询 %s 挂单失败，仅按已知 oid 撤止损: %s", symbol, exc)
+        if not oids:
+            return []
+        logger.info("%s 替换保护止损前先撤已有 reduce-only 止损: %s", symbol, _unique_oids(oids))
+        return self._cancel_oids(symbol, oids)
+
+    def _place_protective_stop(
+        self,
+        intent: OrderIntent,
+        fill: OrderFill,
+        *,
+        is_buy: bool,
+        sz_decimals: int,
+    ) -> dict[str, Any]:
+        sl_sz = self.round_size_cover(intent.symbol, protective_stop_size(intent, fill.size), sz_decimals)
+        if sl_sz <= 0:
+            return {"status": "skipped", "message": "stop size is 0"}
+        extra: list[int] = []
+        old_oid = intent.extras.get("sl_oid")
+        if old_oid is not None:
+            try:
+                extra.append(int(old_oid))
+            except (TypeError, ValueError):
+                logger.warning("忽略非法 sl_oid=%s", old_oid)
+        self.cancel_reduce_only_stops(intent.symbol, extra_oids=extra)
+        sl_is_buy = not is_buy
+        stop_px = float(f"{intent.stop_price:.5g}")
+        sl_type = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}
+        sl = self._exchange.order(intent.symbol, sl_is_buy, sl_sz, stop_px, sl_type, reduce_only=True)
+        return {"result": sl, "size": sl_sz, "oid": extract_oid(sl)}
+
+    def ensure_protective_stop(
+        self,
+        symbol: str,
+        side: Side,
+        position_size: float,
+        stop_price: float,
+        *,
+        sz_decimals: int = 4,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """保证该币恰好一张 reduce-only 保护止损，张数≈持仓，触发价≈策略止损。
+
+        已有一张匹配的就留下，只撤重复或不匹配的；一张都没有或张数/价格不对则撤掉再挂。
+        """
+        if self._exchange is None:
+            return {"status": "skipped", "action": "no_exchange"}
+        target_sz = self.round_size_cover(symbol, abs(position_size), sz_decimals)
+        if target_sz <= 0 or stop_price <= 0:
+            return {"status": "skipped", "action": "bad_size"}
+        target_px = normalize_px(stop_price)
+        want_buy = side is Side.SHORT
+        rows = list(open_orders if open_orders is not None else self.fetch_open_orders())
+        stops = [row for row in rows if isinstance(row, dict) and is_reduce_only_stop_order(row, symbol)]
+
+        def _matches(order: dict[str, Any]) -> bool:
+            buy = order_is_buy(order)
+            if buy is not None and buy is not want_buy:
+                return False
+            return sizes_close(order_size(order), target_sz, sz_decimals) and prices_close(
+                order_trigger_px(order), target_px
+            )
+
+        matching = [row for row in stops if _matches(row)]
+        match_ids = {id(row) for row in matching}
+        extras = [row for row in stops if id(row) not in match_ids]
+        if matching:
+            keep = matching[0]
+            cancel_ids = [oid for row in matching[1:] + extras if (oid := order_oid(row)) is not None]
+            cancelled = self._cancel_oids(symbol, cancel_ids) if cancel_ids else []
+            kept_oid = order_oid(keep)
+            if cancelled:
+                logger.info("%s 保留匹配保护止损 oid=%s，撤销重复 %s", symbol, kept_oid, cancelled)
+            return {
+                "status": "ok",
+                "action": "kept",
+                "oid": kept_oid,
+                "size": target_sz,
+                "cancelled": cancelled,
+            }
+
+        cancel_ids = [oid for row in stops if (oid := order_oid(row)) is not None]
+        cancelled = self._cancel_oids(symbol, cancel_ids) if cancel_ids else []
+        sl_type = {"trigger": {"triggerPx": target_px, "isMarket": True, "tpsl": "sl"}}
+        try:
+            sl = self._exchange.order(symbol, want_buy, target_sz, target_px, sl_type, reduce_only=True)
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                raise
+            logger.warning("挂 %s 保护止损失败: %s", symbol, exc)
+            return {
+                "status": "error",
+                "action": "place_failed",
+                "cancelled": cancelled,
+                "message": str(exc),
+            }
+        oid = extract_oid(sl)
+        logger.info(
+            "%s 保护止损已对齐 size=%.6g stop=%s oid=%s cancelled=%s",
+            symbol,
+            target_sz,
+            target_px,
+            oid,
+            cancelled,
+        )
+        return {
+            "status": "ok",
+            "action": "placed",
+            "oid": oid,
+            "size": target_sz,
+            "cancelled": cancelled,
+            "result": sl,
+        }
+
+    def place(self, intent: OrderIntent, *, sz_decimals: int = 4) -> dict[str, Any]:
+        if self.cfg.dry_run or self._exchange is None:
+            return {"status": "dry_run", "intent": intent.reason}
+        self.cfg.require_live_ready()
+        is_buy = intent.side is Side.LONG
+        size = self.round_size(intent.symbol, intent.size, sz_decimals)
+        if size <= 0:
+            return {"status": "error", "message": "rounded size is 0"}
+
+        if not intent.reduce_only:
+            self._exchange.update_leverage(int(intent.leverage), intent.symbol, is_cross=not intent.isolated)
+
+        if intent.reduce_only:
+            if intent.kind is OrderKind.MARKET:
+                return self._exchange.market_close(intent.symbol, sz=size)
+            tif = self._limit_tif(intent.kind)
+            return self._exchange.order(
+                intent.symbol,
+                is_buy,
+                size,
+                float(f"{intent.price:.5g}"),
+                {"limit": {"tif": tif}},
+                reduce_only=True,
+            )
+
+        result = self._submit_entry(intent, is_buy=is_buy, size=size)
+        fill = extract_order_fill(result)
+        retried_gtc = False
+        # 补仓 post-only 被拒：同价再试一次 GTC（会立刻成交的 Alo 本就会吃单）。
+        # 不改 chase_symbols / 不用市价追 ETH：BTC 大实体补仓信号层已是 MARKET。
+        if (
+            fill is None
+            and intent.action is IntentAction.ADD
+            and intent.kind is OrderKind.MAKER_LIMIT
+            and is_post_only_reject(result)
+        ):
+            retry_px = gtc_retry_price(is_buy, float(intent.price), self.fetch_best_bid_ask(intent.symbol))
+            if retry_px is None:
+                logger.warning(
+                    "%s post-only ADD 被拒（%s），读不到盘口，不做 GTC 重试（避免价格越过盘口）",
+                    intent.symbol,
+                    "; ".join(collect_error_messages(result)) or result,
+                )
+            else:
+                logger.warning(
+                    "%s post-only ADD 被拒（%s），以 %s 再试一次 GTC（买单不高于卖一/卖单不低于买一），而不是市价追价",
+                    intent.symbol,
+                    "; ".join(collect_error_messages(result)) or result,
+                    retry_px,
+                )
+                retried_gtc = True
+                retry = self._submit_entry(intent, is_buy=is_buy, size=size, tif="Gtc", price=retry_px)
+                result = {
+                    "status": "ok",
+                    "order": retry,
+                    "post_only_reject": result,
+                    "post_only_retry": "gtc",
+                    "post_only_retry_px": retry_px,
+                }
+                fill = extract_order_fill(retry)
+
+        if fill is None or fill.size <= 0:
+            # 市价本意却只 resting，或 GTC 补试未成交：撤掉本轮入场挂单，绝不挂新止损。
+            # Maker 限价继续留在盘口，等后续扫描对账成交后再补保护止损，避免同价重复挂。
+            cancelled: list[int] = []
+            if intent.kind is OrderKind.MARKET or retried_gtc:
+                cancelled = self._cancel_resting_entry(intent.symbol, result)
+            kept = [oid for oid in extract_resting_oids(result) if oid not in set(cancelled)]
+            logger.warning("入场/加仓未确认成交，不挂本轮保护止损: %s", result)
+            if not isinstance(result, dict):
+                result = {"status": "ok", "order": result}
+            else:
+                result = dict(result)
+            result["entry_unfilled"] = True
+            result["resting_oids"] = kept
+            return result
+
+        if not intent.stop_price:
+            return {"status": "ok", "order": result, "stop": None}
+
+        stop_intent = intent
+        if intent.action is IntentAction.OPEN and fill.price:
+            new_stop = stop_from_fill(intent, fill.price)
+            if abs(new_stop - float(intent.stop_price)) > 1e-12:
+                logger.info(
+                    "%s 首仓成交价 %.6g（信号价 %.6g），初始止损按成交价重算 %.6g → %.6g（止损距离不变）",
+                    intent.symbol,
+                    fill.price,
+                    intent.price,
+                    intent.stop_price,
+                    new_stop,
+                )
+                stop_intent = replace(intent, stop_price=new_stop)
+        stop_payload = self._place_protective_stop(stop_intent, fill, is_buy=is_buy, sz_decimals=sz_decimals)
+        return {
+            "status": "ok",
+            "order": result,
+            "stop": stop_payload.get("result"),
+            "stop_size": stop_payload.get("size"),
+            "stop_oid": stop_payload.get("oid"),
+            "stop_price": stop_intent.stop_price,
+        }
+
+
+def stop_from_fill(intent: OrderIntent, fill_price: float) -> float:
+    """首仓止损按真实成交价平移：保持信号的止损距离（信号价通常是 mid/收盘价）。"""
+    stop = float(intent.stop_price or 0.0)
+    if stop <= 0 or fill_price <= 0 or intent.price <= 0:
+        return stop
+    distance = abs(float(intent.price) - stop)
+    if intent.side is Side.LONG:
+        return fill_price - distance
+    return fill_price + distance
+
+
+def gtc_retry_price(is_buy: bool, price: float, book: tuple[float, float] | None) -> float | None:
+    """post-only 被拒后的 GTC 重试价：买单不高于卖一、卖单不低于买一；无盘口返回 None。"""
+    if book is None or price <= 0:
+        return None
+    bid, ask = book
+    if is_buy:
+        return min(price, ask)
+    return max(price, bid)
+
+
+def math_floor(size: float, factor: int) -> float:
+    # +1e-9 避免 0.0006*1e4=5.999... 被 floor 成 0.0005（BTC 默认 4 位小数时尤其致命）
+    return int(size * factor + 1e-9) / factor
+
+
+def math_ceil(size: float, factor: int) -> float:
+    # -1e-9 避免刚好落在步进上时被抬到下一档
+    if size <= 0 or factor <= 0:
+        return 0.0
+    return int(size * factor - 1e-9 + 0.999999999) / factor
