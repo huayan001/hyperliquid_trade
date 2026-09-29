@@ -3,6 +3,7 @@ import json, time, requests, sys
 from pathlib import Path
 U = "https://api.hyperliquid.xyz/info"
 OUT = Path(__file__).parent / "data"
+OUT.mkdir(exist_ok=True)
 NOW = int(time.time() * 1000)
 DAY = 86_400_000
 START = NOW - 250 * DAY   # 6 months test + warmup for daily EMA50
@@ -36,8 +37,6 @@ for sym in ["BTC", "ETH", "SOL", "HYPE"]:
         f.write_text(json.dumps([d[k] for k in sorted(d)]))
         print(sym, iv, len(d), flush=True)
     f = OUT / f"{sym}_funding.json"
-    if True:
-        continue
     if not f.exists():
         rows, start = [], START
         while start < NOW:
