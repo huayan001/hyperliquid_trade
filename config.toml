@@ -36,10 +36,12 @@ chase_body_atr = 1.5
 chase_symbols = ["BTC"]
 risk_pct = 0.01               # 单笔风险 1% 权益（实盘若设了 HL_RISK_PCT，仍以环境变量为准）
 btc_short_risk_mult = 0.7
-max_positions = 2
+max_positions = 4             # 同时趋势仓上限；实盘单笔 1% × 4 仓正好用满 portfolio_risk_max
 portfolio_risk_max = 0.04
-daily_loss_delever = 0.05
+daily_loss_delever = 0.05     # 达到后仓位减半，不停止开仓
 weekly_loss_delever = 0.10
+# 当日亏损达到该比例则停止新开仓和金字塔加仓（已有仓的止损/离场不动）。0 = 关闭
+daily_loss_halt = 0.03
 funding_annual_warn = 0.50
 # 高资金费时仓位下调系数（不做马丁，只缩小）
 funding_size_mult = 0.5

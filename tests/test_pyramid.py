@@ -129,6 +129,34 @@ def test_pyramid_rejects_when_already_added_max() -> None:
     assert strat.generate_pyramid(pos, snap, _confirmed()) is None
 
 
+def test_pyramid_blocked_when_daily_loss_halt_hit() -> None:
+    strat = TrendStrategy()
+    pos = _pos(size=2.0)
+    sig = strat.generate_pyramid(pos, market("ETH", h4=_wide_h4(), mid=111.0), _confirmed())
+    assert sig is not None
+
+    cfg = BotConfig()
+    cfg.trend.daily_loss_halt = 0.03
+    rm = RiskManager(cfg)
+    halted = _acct(pos)
+    halted.day_start_equity = 10_000
+    halted.equity = 9_700
+    verdict = rm.evaluate_pyramid(sig, pos, halted)
+    assert not verdict.allowed
+    assert verdict.reason == "趋势策略：当日亏损已达 3% 上限，停止金字塔加仓"
+
+    below = _acct(pos)
+    below.day_start_equity = 10_000
+    below.equity = 9_710
+    assert rm.evaluate_pyramid(sig, pos, below).allowed
+
+    cfg.trend.daily_loss_halt = 0.0
+    still = _acct(pos)
+    still.day_start_equity = 10_000
+    still.equity = 9_700
+    assert RiskManager(cfg).evaluate_pyramid(sig, pos, still).allowed
+
+
 def test_evaluate_open_still_blocks_duplicate() -> None:
     rm = RiskManager(BotConfig())
     pos = _pos()
