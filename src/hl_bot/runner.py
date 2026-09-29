@@ -15,6 +15,8 @@ from hl_bot.exchange.client import (
     extract_order_fill,
     extract_resting_oids,
     is_open_entry_order,
+    is_reduce_only_stop_order,
+    order_trigger_px,
     is_rate_limit_error,
     normalize_px,
     order_is_buy,
@@ -22,6 +24,7 @@ from hl_bot.exchange.client import (
     order_oid,
     prices_close,
     same_resting_entry,
+    short_errors,
 )
 from hl_bot.exchange.paper import PaperBroker
 from hl_bot.models import (
@@ -45,7 +48,13 @@ from hl_bot.funding import (
     should_exit_on_funding_spike,
 )
 from hl_bot.regime import route_regime
-from hl_bot.risk import RiskManager, apply_fill, clamp_stop_for_leverage
+from hl_bot.risk import (
+    RiskManager,
+    apply_fill,
+    apply_pyramid,
+    apply_tier_add,
+    clamp_stop_for_leverage,
+)
 from hl_bot.strategies.mean_reversion import MeanReversionStrategy
 from hl_bot.strategies.trend import TrendStrategy
 
@@ -57,6 +66,10 @@ EQUITY_CACHE_MAX_AGE_MS = 24 * 3600 * 1000
 EQUITY_SUSPECT_DROP_PCT = 0.5
 # 可疑读数连续两轮在该相对误差内一致则接受（避免真实大跌时永久卡在缓存）
 EQUITY_SUSPECT_CONFIRM_TOL = 0.10
+FOUR_HOURS_MS = 4 * 3_600_000
+# 幽灵仓查成交：最多回看天数；查询失败最多推迟几轮再清
+GHOST_FILL_LOOKBACK_MS = 7 * 24 * 3_600_000
+GHOST_FILL_MAX_DEFER = 3
 
 
 @dataclass
@@ -110,6 +123,7 @@ class BotRunner:
         self._equity_ok = True
         # 上一轮被判为可疑的权益读数；连续两轮一致则视为真实变化而接受
         self._suspect_equity: float | None = None
+        self._reconcile_ctxs: dict = {}
         if self.account.equity_abstraction and hasattr(self.client, "last_abstraction"):
             if not getattr(self.client, "last_abstraction", None):
                 self.client.last_abstraction = self.account.equity_abstraction
@@ -237,7 +251,13 @@ class BotRunner:
             else:
                 notes.append("中间地带/冲突：不新开仓")
 
+            cooldown = None
             if signal is not None and existing is None and not closing:
+                cooldown = self.stop_cooldown_reason(symbol, signal.side, now_ms)
+                if cooldown:
+                    notes.append(f"止损冷却拒绝：{cooldown}")
+                    logger.info("%s 新开仓被止损冷却拒绝：%s", symbol, cooldown)
+            if signal is not None and existing is None and not closing and not cooldown:
                 against = funding_against(signal.side, market.funding.hourly_rate)
                 huge_funding = (
                     against
@@ -361,10 +381,7 @@ class BotRunner:
         elif reading is None:
             reason = "权益读取异常"
         else:
-            reason = (
-                f"权益读取不完整（部分值 ${reading.equity:.2f}，formula={reading.formula}，"
-                f"errors={'; '.join(reading.errors) or '-'}）"
-            )
+            reason = f"权益读取不完整（{'; '.join(short_errors(list(reading.errors))) or '-'}，部分读数不采用）"
             self._suspect_equity = None
 
         cached = self._cached_equity(now_ms)
@@ -415,6 +432,7 @@ class BotRunner:
         if self.cfg.dry_run:
             return
         self._live_book_ok = False
+        self._reconcile_ctxs = dict(ctxs or {})
         self.client.connect_sdk(for_trading=True)
         orders = self.client.fetch_open_orders()
         positions = self.client.fetch_perp_positions()
@@ -495,56 +513,218 @@ class BotRunner:
                 return True
         return False
 
+    def _mark_px(self, symbol: str) -> float:
+        meta = self._reconcile_ctxs.get(symbol) or self._reconcile_ctxs.get(symbol.upper()) or {}
+        try:
+            return float(meta.get("mark_px") or meta.get("mid_px") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _stop_wrong_side(side: Side, stop: float, mark: float) -> bool:
+        """止损已在现价错误一侧（挂上去会立刻触发）。mark 未知时不判定。"""
+        if mark <= 0 or stop <= 0:
+            return False
+        return stop >= mark if side is Side.LONG else stop <= mark
+
     def _adopt_resting_fill(self, rec: RestingEntry, ex: ExchangePosition) -> None:
-        """resting 单已离开盘口且持仓变大：视为随后成交，补上本地仓位。"""
+        """resting 入场/加仓单已离开盘口且持仓变大：视为随后成交。
+
+        - 均价以交易所 entryPx 为准；
+        - 首仓：止损按真实成交价平移（保持信号止损距离）；
+        - Donchian 补仓：更新分层计数（tier_add_done 等），共用止损；
+        - 金字塔：更新加仓计数，并按真实均价重算保本止损；
+        - 按交易所实际止损核算风险，超过单笔风险上限（2% 权益）则收紧；
+        随后同一轮 _ensure_managed_stops 会把 reduce-only 止损替换为覆盖整仓。
+        """
         tol = max(1e-8, rec.position_size_at_submit * 0.02, 10 ** -4)
         if ex.size <= rec.position_size_at_submit + tol:
             return
         local = self.account.position_for(rec.symbol)
+        side = Side(rec.side)
         if local is None:
             if not rec.stop_price or rec.stop_price <= 0:
                 logger.warning("%s resting 已成交但没有策略止损价，不臆造保护单", rec.symbol)
                 return
+            entry = float(ex.entry_price or rec.price)
+            stop = float(rec.stop_price)
+            if rec.price > 0 and entry > 0:
+                distance = abs(rec.price - stop)
+                stop = entry - distance if side is Side.LONG else entry + distance
+                stop, _ = clamp_stop_for_leverage(
+                    side=side,
+                    entry=entry,
+                    stop=stop,
+                    leverage=max(1, int(self.cfg.risk.target_leverage)),
+                    buffer_frac=float(self.cfg.risk.liq_buffer_frac),
+                )
             pos = Position(
                 symbol=rec.symbol,
                 strategy=StrategyName(rec.strategy),
-                side=Side(rec.side),
+                side=side,
                 size=ex.size,
-                entry_price=ex.entry_price or rec.price,
-                stop_price=rec.stop_price,
+                entry_price=entry,
+                stop_price=stop,
                 leverage=rec.leverage,
                 opened_ts=int(time.time() * 1000),
                 tag=rec.tag,
                 extras=dict(rec.extras),
             )
-            pos.extras.setdefault("_opened_size", ex.size)
+            pos.extras["_opened_size"] = ex.size
             apply_fill(self.account, pos)
-            logger.info("%s resting %s 已成交，纳入本地仓位 size=%.6g", rec.symbol, rec.action, ex.size)
+            logger.info(
+                "%s resting %s 已成交，纳入本地仓位 size=%.6g 均价=%.6g（挂单价 %.6g）止损=%.6g（原 %.6g）",
+                rec.symbol,
+                rec.action,
+                ex.size,
+                entry,
+                rec.price,
+                stop,
+                rec.stop_price,
+            )
+            self._cap_position_risk(pos)
             return
         if local.side is not ex.side:
             return
-        if ex.size > local.size + max(local.size * 0.02, 1e-8):
-            logger.info(
-                "%s 交易所仓 %.6g 大于本地 %.6g（resting 随后成交），按交易所张数对齐",
-                rec.symbol,
-                ex.size,
-                local.size,
-            )
+        if ex.size <= local.size + max(local.size * 0.02, 1e-8):
+            return
+        old_size = local.size
+        old_entry = local.entry_price
+        add_size = ex.size - old_size
+        real_entry = float(ex.entry_price or 0.0)
+        if real_entry <= 0:
+            real_entry = (old_entry * old_size + rec.price * add_size) / ex.size
+        add_px = (real_entry * ex.size - old_entry * old_size) / add_size if add_size > 0 else rec.price
+        if add_px <= 0:
+            add_px = rec.price
+        is_tier = bool(rec.extras.get("tier_add") or rec.extras.get("breakout_add")) or rec.tier == "donchian_close_breakout"
+        is_pyramid = bool(rec.extras.get("pyramid")) or rec.tier == "pyramid_add"
+        old_stop = local.stop_price
+        if is_tier and local.starter_pending():
+            apply_tier_add(self.account, local, add_size, add_px, local.stop_price)
+            kind = "Donchian 补仓"
+        elif is_pyramid:
+            current = local.stop_price
+            if rec.stop_price and rec.stop_price > 0:
+                current = max(current, rec.stop_price) if local.side is Side.LONG else min(current, rec.stop_price)
+            atr_v = float(rec.extras.get("atr") or 0.0)
+            new_stop = self.trend.pyramid_breakeven_stop(real_entry, atr_v, local.side, current)
+            mark = self._mark_px(local.symbol)
+            if self._stop_wrong_side(local.side, new_stop, mark):
+                logger.warning(
+                    "%s 金字塔成交后保本止损 %.6g 已在现价 %.6g 错误一侧，暂保留原止损 %.6g",
+                    local.symbol,
+                    new_stop,
+                    mark,
+                    local.stop_price,
+                )
+                new_stop = local.stop_price
+            apply_pyramid(self.account, local, add_size, add_px, new_stop)
+            kind = "金字塔加仓"
+        else:
             local.size = ex.size
+            kind = "加仓"
+        local.size = ex.size
+        local.entry_price = real_entry
+        logger.info(
+            "%s resting %s 随后成交：size %.6g→%.6g，均价 %.6g→%.6g（交易所 entryPx，加仓段≈%.6g），"
+            "止损 %.6g→%.6g，pyramid_count=%s tier_add_done=%s",
+            rec.symbol,
+            kind,
+            old_size,
+            ex.size,
+            old_entry,
+            real_entry,
+            add_px,
+            old_stop,
+            local.stop_price,
+            local.extras.get("pyramid_count", 0),
+            bool(local.extras.get("tier_add_done")),
+        )
+        self._cap_position_risk(local)
+
+    def _exchange_stop_px(self, symbol: str, side: Side) -> float | None:
+        """交易所上该币 reduce-only 止损触发价；多张时取风险最大（最宽）的一张。"""
+        best: float | None = None
+        for order in self._open_orders or []:
+            if not isinstance(order, dict) or not is_reduce_only_stop_order(order, symbol):
+                continue
+            px = order_trigger_px(order)
+            if px <= 0:
+                continue
+            if best is None:
+                best = px
+            elif side is Side.LONG:
+                best = min(best, px)
+            else:
+                best = max(best, px)
+        return best
+
+    def _risk_pct_for(self, pos: Position) -> float:
+        if pos.strategy is StrategyName.MEAN_REVERSION:
+            return float(self.cfg.mean_reversion.risk_pct)
+        pct = float(self.cfg.trend.risk_pct)
+        if pos.side is Side.SHORT and pos.symbol.upper() == "BTC":
+            pct *= float(self.cfg.trend.btc_short_risk_mult)
+        return pct
+
+    def _cap_position_risk(self, pos: Position) -> None:
+        """按交易所实际止损（没有则本地止损）核算该仓风险；超过 risk_pct×权益则收紧本地止损。"""
+        equity = float(self.account.equity or 0.0)
+        if equity <= 0 or not self._equity_ok or pos.size <= 0 or pos.entry_price <= 0:
+            return
+        ex_stop = self._exchange_stop_px(pos.symbol, pos.side)
+        candidates = [px for px in (ex_stop, pos.stop_price) if px and px > 0]
+        if not candidates:
+            return
+        # 取两者里更宽的一个：本轮替换前真正挂着的是交易所那张
+        stop_for_risk = min(candidates) if pos.side is Side.LONG else max(candidates)
+        if pos.side is Side.LONG:
+            risk = max(0.0, (pos.entry_price - stop_for_risk) * pos.size)
+        else:
+            risk = max(0.0, (stop_for_risk - pos.entry_price) * pos.size)
+        limit = equity * self._risk_pct_for(pos)
+        if risk <= limit * (1.0 + 1e-6):
+            return
+        per_unit = limit / pos.size
+        cap_stop = pos.entry_price - per_unit if pos.side is Side.LONG else pos.entry_price + per_unit
+        if pos.side is Side.LONG:
+            new_stop = max(pos.stop_price, cap_stop)
+        else:
+            new_stop = min(pos.stop_price, cap_stop)
+        mark = self._mark_px(pos.symbol)
+        if self._stop_wrong_side(pos.side, new_stop, mark):
+            logger.warning(
+                "%s 风险 $%.2f 超过上限 $%.2f，但收紧后的止损 %.6g 已在现价 %.6g 错误一侧，不自动收紧",
+                pos.symbol,
+                risk,
+                limit,
+                new_stop,
+                mark,
+            )
+            return
+        if abs(new_stop - pos.stop_price) <= 1e-12:
+            return
+        logger.warning(
+            "%s 按交易所止损 %.6g 核算风险 $%.2f > %.1f%% 权益 $%.2f，收紧止损 %.6g → %.6g",
+            pos.symbol,
+            stop_for_risk,
+            risk,
+            self._risk_pct_for(pos) * 100,
+            limit,
+            pos.stop_price,
+            new_stop,
+        )
+        pos.stop_price = new_stop
+        pos.extras["stop_tightened_for_risk"] = True
 
     def _align_open_sizes(self, positions: dict[str, ExchangePosition]) -> None:
         """本地已在管的仓与交易所对账：无仓则清幽灵，张数以交易所为准。"""
         for local in list(self.account.open_positions()):
             ex = self._exchange_position(positions, local.symbol)
             if ex is None or ex.size <= 0:
-                logger.warning(
-                    "%s 交易所已无仓但本地仍有 %.6g %s，清除幽灵仓（疑似强平/外部平仓） sl_oid=%s",
-                    local.symbol,
-                    local.size,
-                    local.side.value,
-                    local.extras.get("sl_oid"),
-                )
-                self.account.positions = [p for p in self.account.positions if p is not local]
+                if self._resolve_flat_position(local):
+                    self.account.positions = [p for p in self.account.positions if p is not local]
                 continue
             if ex.side is not local.side:
                 logger.warning(
@@ -564,6 +744,129 @@ class BotRunner:
                     local.size,
                 )
                 local.size = ex.size
+            if ex.entry_price and ex.entry_price > 0 and local.entry_price > 0:
+                if abs(ex.entry_price - local.entry_price) / local.entry_price > 1e-4:
+                    logger.info(
+                        "%s 本地入场价 %.6g 与交易所 entryPx %.6g 不一致，以交易所为准",
+                        local.symbol,
+                        local.entry_price,
+                        ex.entry_price,
+                    )
+                local.entry_price = float(ex.entry_price)
+            local.extras.pop("ghost_fill_checks", None)
+
+    def _resolve_flat_position(self, local: Position) -> bool:
+        """交易所已无仓：先查 userFillsByTime 判定是否本方止损/平仓成交，再决定标签。
+
+        返回 True 表示可以清除本地仓；查询失败时最多推迟 GHOST_FILL_MAX_DEFER 轮。
+        """
+        now_ms = int(time.time() * 1000)
+        opened = int(local.opened_ts or 0)
+        start = max(opened - 60_000, now_ms - GHOST_FILL_LOOKBACK_MS) if opened > 0 else now_ms - GHOST_FILL_LOOKBACK_MS
+        sl_oid = local.extras.get("sl_oid")
+        try:
+            fills = self.client.fetch_user_fills_by_time(start)
+        except Exception as exc:
+            checks = int(local.extras.get("ghost_fill_checks") or 0) + 1
+            local.extras["ghost_fill_checks"] = checks
+            if checks < GHOST_FILL_MAX_DEFER:
+                logger.warning(
+                    "%s 交易所已无仓，但查询成交记录失败（%s），第 %d 次，下一轮再核对后清除",
+                    local.symbol,
+                    exc,
+                    checks,
+                )
+                return False
+            logger.warning(
+                "%s 交易所已无仓且连续 %d 次查不到成交记录，清除本地仓（未确认原因） sl_oid=%s",
+                local.symbol,
+                checks,
+                sl_oid,
+            )
+            return True
+        closing = close_fills_for(fills, local)
+        if not closing:
+            logger.warning(
+                "%s 交易所已无仓但本地仍有 %.6g %s，且未找到本方平仓成交，清除幽灵仓（疑似强平/外部平仓） sl_oid=%s",
+                local.symbol,
+                local.size,
+                local.side.value,
+                sl_oid,
+            )
+            return True
+        qty = sum(_f(row.get("sz")) for row in closing)
+        vwap = sum(_f(row.get("px")) * _f(row.get("sz")) for row in closing) / qty if qty > 0 else 0.0
+        pnl = sum(_f(row.get("closedPnl")) - _f(row.get("fee")) for row in closing)
+        last_ts = max(int(_f(row.get("time"))) for row in closing)
+        own_stop = sl_oid is not None and any(_same_oid(row.get("oid"), sl_oid) for row in closing)
+        liquidated = any(row.get("liquidation") for row in closing)
+        if liquidated and not own_stop:
+            label = "强平成交"
+        elif own_stop:
+            label = "止损成交"
+        elif _stop_side_fill(local, vwap):
+            label = "止损成交"
+        else:
+            label = "外部平仓成交"
+        self.account.realized_pnl_today += pnl
+        self._record_stop(local.symbol, local.side, vwap, pnl, last_ts, label=label)
+        logger.warning(
+            "%s %s：%s %.6g @ 均价 %.6g，已实现盈亏 $%.4f（含手续费），sl_oid=%s 本方止损=%s 强平=%s；清除本地仓",
+            local.symbol,
+            label,
+            local.side.value,
+            qty,
+            vwap,
+            pnl,
+            sl_oid,
+            own_stop,
+            liquidated,
+        )
+        self.alerts.send(f"{local.symbol} {label} {local.side.value} {qty:.6g} @ {vwap:.6g} pnl=${pnl:.4f}")
+        return True
+
+    def _record_stop(
+        self,
+        symbol: str,
+        side: Side,
+        price: float,
+        pnl: float,
+        ts_ms: int,
+        *,
+        label: str = "止损",
+    ) -> None:
+        self.account.last_stops[symbol.upper()] = {
+            "ts": int(ts_ms),
+            "side": side.value,
+            "price": float(price),
+            "pnl": float(pnl),
+            "label": label,
+        }
+
+    def stop_cooldown_reason(self, symbol: str, side: Side, now_ms: int) -> str | None:
+        """止损后同标的同方向：至少再收 N 根 4h K 线才允许新开仓。"""
+        bars = int(getattr(self.cfg.trend, "stop_cooldown_bars_4h", 0) or 0)
+        if bars <= 0:
+            return None
+        rec = self.account.last_stops.get(symbol.upper())
+        if not rec:
+            return None
+        if str(rec.get("side") or "") != side.value:
+            return None
+        stop_ts = int(rec.get("ts") or 0)
+        if stop_ts <= 0:
+            return None
+        first_boundary = -(-stop_ts // FOUR_HOURS_MS) * FOUR_HOURS_MS
+        closed = max(0, (now_ms - first_boundary) // FOUR_HOURS_MS)
+        if closed >= bars:
+            return None
+        ready_ms = first_boundary + bars * FOUR_HOURS_MS
+        ready = datetime.fromtimestamp(ready_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return (
+            f"{symbol} {side.value} 于 {datetime.fromtimestamp(stop_ts / 1000, tz=timezone.utc):%Y-%m-%d %H:%M} UTC "
+            f"{rec.get('label') or '止损'} @ {float(rec.get('price') or 0):.6g}，"
+            f"之后已收盘 4h K 线 {closed}/{bars} 根，{ready} 后才允许同向再开"
+        )
 
     def _ensure_margin_for_target_leverage(
         self,
@@ -861,7 +1164,9 @@ class BotRunner:
         if self.cfg.dry_run:
             logger.info("DRY-RUN 意图: %s", _format_intent(intent))
             if persist_paper:
-                self.broker.submit(intent, now_ms)
+                closed_pos = self.account.position_for(intent.symbol)
+                outcome = self.broker.submit(intent, now_ms)
+                self._maybe_record_bot_stop(intent, closed_pos, intent.price, outcome, now_ms)
             return
         self.client.connect_sdk(for_trading=True)
         meta = self._asset_ctxs.get(intent.symbol) or self._asset_ctxs.get(intent.symbol.upper()) or {}
@@ -869,6 +1174,22 @@ class BotRunner:
         result = self.client.place(intent, sz_decimals=decimals)
         logger.info("实盘下单返回: %s", result)
         self._sync_live_fill(intent, result, now_ms)
+
+    def _maybe_record_bot_stop(
+        self,
+        intent: OrderIntent,
+        pos: Position | None,
+        price: float,
+        outcome: object,
+        now_ms: int,
+    ) -> None:
+        """机器人自己按硬止损平仓后也记冷却（交易所止损单成交走幽灵仓路径记录）。"""
+        if intent.action is not IntentAction.CLOSE or pos is None:
+            return
+        if "止损" not in str(intent.reason or ""):
+            return
+        pnl = float(outcome.get("pnl") or 0.0) if isinstance(outcome, dict) else 0.0
+        self._record_stop(intent.symbol, pos.side, float(price or 0.0), pnl, now_ms, label="硬止损平仓")
 
     def run_forever(self) -> None:
         logger.info(
@@ -907,7 +1228,13 @@ class BotRunner:
         sync_intent = intent.with_size(fill.size)
         if fill.price:
             sync_intent = replace(sync_intent, price=fill.price)
-        self.broker.submit(sync_intent, now_ms)
+        if isinstance(result, dict) and intent.action is IntentAction.OPEN:
+            fill_stop = result.get("stop_price")
+            if fill_stop:
+                sync_intent = replace(sync_intent, stop_price=float(fill_stop))
+        closed_pos = self.account.position_for(intent.symbol)
+        outcome = self.broker.submit(sync_intent, now_ms)
+        self._maybe_record_bot_stop(intent, closed_pos, fill.price or intent.price, outcome, now_ms)
         if isinstance(result, dict):
             sl_oid = result.get("stop_oid")
             if sl_oid is None:
@@ -917,6 +1244,52 @@ class BotRunner:
                 pos.extras["sl_oid"] = int(sl_oid)
         # scan --live 默认不 persist_paper，成交后仍要落盘，避免下一轮重复平已空仓
         self.broker.save()
+
+
+def _f(value: object) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _same_oid(left: object, right: object) -> bool:
+    try:
+        return int(left) == int(right)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+
+
+def close_fills_for(fills: list[dict], pos: Position) -> list[dict]:
+    """userFillsByTime 里属于该仓的平仓成交（同币、Close Long/Short 或 reduce 方向、开仓之后）。"""
+    want_dir = "close long" if pos.side is Side.LONG else "close short"
+    close_side = "A" if pos.side is Side.LONG else "B"
+    since = int(pos.opened_ts or 0) - 60_000
+    out: list[dict] = []
+    for row in fills or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("coin") or "").upper() != pos.symbol.upper():
+            continue
+        if since > 0 and int(_f(row.get("time"))) < since:
+            continue
+        direction = str(row.get("dir") or "").strip().lower()
+        if direction:
+            if not direction.startswith(want_dir) and "liquidat" not in direction:
+                continue
+        elif str(row.get("side") or "") != close_side:
+            continue
+        out.append(row)
+    return out
+
+
+def _stop_side_fill(pos: Position, px: float) -> bool:
+    """成交价在止损附近或更差（多头 ≤ 止损×1.002）视为止损类成交。"""
+    if px <= 0 or not pos.stop_price:
+        return False
+    if pos.side is Side.LONG:
+        return px <= pos.stop_price * 1.002
+    return px >= pos.stop_price * 0.998
 
 
 def _intent_tier(intent: OrderIntent) -> str:

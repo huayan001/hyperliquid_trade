@@ -304,6 +304,8 @@ class AccountState:
     last_good_day_key: str = ""
     # 最近一次成功读到的账户模式（unifiedAccount 等）
     equity_abstraction: str = ""
+    # 每个标的最近一次止损出场：{"ts": ms, "side": "long"/"short", "price": float, "pnl": float}
+    last_stops: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def open_positions(self) -> list[Position]:
         return [p for p in self.positions if p.size > 0]

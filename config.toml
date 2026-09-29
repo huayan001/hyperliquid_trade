@@ -57,6 +57,8 @@ starter_enabled = true
 starter_frac = 0.35
 # 空列表 = 所有趋势标的；可写成 ["BTC", "ETH"] 只对部分品种启用
 starter_symbols = []
+# 止损出场后同标的同方向冷却：至少等 N 根已收盘 4h K 线（0 = 关闭）
+stop_cooldown_bars_4h = 2
 
 [mean_reversion]
 bb_period = 20

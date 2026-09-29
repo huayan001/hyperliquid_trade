@@ -7,7 +7,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -457,6 +457,15 @@ def candle_from_hl(raw: dict[str, Any]) -> Candle:
     )
 
 
+def short_errors(errors: list[str] | tuple[str, ...]) -> list[str]:
+    """错误摘要：只保留来源标签与是否 429，不打印整段响应头。"""
+    out: list[str] = []
+    for err in errors:
+        label = str(err).split(":", 1)[0]
+        out.append(f"{label} 429" if _message_is_rate_limit(str(err)) else f"{label} 失败")
+    return out
+
+
 def _message_is_rate_limit(message: str) -> bool:
     text = str(message or "")
     if is_rate_limit_error(RuntimeError(text)):
@@ -904,7 +913,10 @@ class HyperliquidClient:
         abstraction = None
         # 仅当两侧都有正数时才需要模式，用来避免 unified 下同一桶 USDC 加两次
         preview = combine_live_equity(perps_raw, spot_raw, None)
-        if preview.perps_value > 0 and preview.free_spot_usdc > 0:
+        if preview.perps_value > 0 and preview.free_spot_usdc > 0 and self.last_abstraction:
+            # 账户模式几乎不变：有缓存就直接用，少打一次 /info（共享 IP 常 429）
+            abstraction = self.last_abstraction
+        elif preview.perps_value > 0 and preview.free_spot_usdc > 0:
             abstraction, abs_err = self._safe_info(
                 {"type": "userAbstraction", "user": address},
                 label="userAbstraction",
@@ -921,16 +933,19 @@ class HyperliquidClient:
                 self.last_abstraction = str(abstraction)
 
         breakdown = combine_live_equity(perps_raw, spot_raw, abstraction)
-        logger.info(
-            "实盘权益 $%.2f [%s] 计入=%s perps=$%.2f 可用现货USDC=$%.2f abstraction=%s%s",
-            breakdown.equity,
-            breakdown.formula,
-            ",".join(breakdown.included) or "none",
-            breakdown.perps_value,
-            breakdown.free_spot_usdc,
-            breakdown.abstraction or "unknown",
-            "" if complete else " (不完整读取)",
-        )
+        if complete:
+            logger.info(
+                "实盘权益 $%.2f [%s] 计入=%s perps=$%.2f 可用现货USDC=$%.2f abstraction=%s",
+                breakdown.equity,
+                breakdown.formula,
+                ",".join(breakdown.included) or "none",
+                breakdown.perps_value,
+                breakdown.free_spot_usdc,
+                breakdown.abstraction or "unknown",
+            )
+        else:
+            # 部分读数不打印金额，避免被误当成权益（曾出现现货 429 时显示 $32–38）
+            logger.info("实盘权益读取不完整（%s），本次读数不采用", "; ".join(short_errors(errors)) or "-")
         logger.debug(
             "权益明细 formula=%s perps=%s spot=%s abstraction=%s errors=%s",
             breakdown.formula,
@@ -1026,6 +1041,42 @@ class HyperliquidClient:
             self.shared_perps_raw = raw
         return parse_perp_positions(raw)
 
+    def fetch_user_fills_by_time(self, start_ms: int, end_ms: int | None = None) -> list[dict[str, Any]]:
+        """账户成交（userFillsByTime）。无地址返回空；429 向上抛。"""
+        address = self.cfg.account_address
+        if not address:
+            return []
+        payload: dict[str, Any] = {
+            "type": "userFillsByTime",
+            "user": address,
+            "startTime": int(start_ms),
+            "aggregateByTime": True,
+        }
+        if end_ms is not None:
+            payload["endTime"] = int(end_ms)
+        raw = self._post_info(payload)
+        return [row for row in (raw or []) if isinstance(row, dict)]
+
+    def fetch_best_bid_ask(self, symbol: str) -> tuple[float, float] | None:
+        """l2Book 最优买一/卖一；失败返回 None。"""
+        try:
+            raw = self._post_info({"type": "l2Book", "coin": symbol})
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                logger.warning("读取 %s 盘口 429: %s", symbol, exc)
+            else:
+                logger.warning("读取 %s 盘口失败: %s", symbol, exc)
+            return None
+        try:
+            levels = raw["levels"]
+            bid = float(levels[0][0]["px"])
+            ask = float(levels[1][0]["px"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        if bid <= 0 or ask <= 0:
+            return None
+        return bid, ask
+
     def _load_perp_state(self, address: str) -> Any:
         if self._info is not None and hasattr(self._info, "user_state"):
             try:
@@ -1042,15 +1093,24 @@ class HyperliquidClient:
     def _limit_tif(self, kind: OrderKind) -> str:
         return "Alo" if kind is OrderKind.MAKER_LIMIT else "Gtc"
 
-    def _submit_entry(self, intent: OrderIntent, *, is_buy: bool, size: float, tif: str | None = None) -> Any:
+    def _submit_entry(
+        self,
+        intent: OrderIntent,
+        *,
+        is_buy: bool,
+        size: float,
+        tif: str | None = None,
+        price: float | None = None,
+    ) -> Any:
         if intent.kind is OrderKind.MARKET and tif is None:
             return self._exchange.market_open(intent.symbol, is_buy, size)
         use_tif = tif or self._limit_tif(intent.kind)
+        px = float(price) if price is not None and price > 0 else float(intent.price)
         return self._exchange.order(
             intent.symbol,
             is_buy,
             size,
-            float(f"{intent.price:.5g}"),
+            float(f"{px:.5g}"),
             {"limit": {"tif": use_tif}},
             reduce_only=False,
         )
@@ -1249,20 +1309,30 @@ class HyperliquidClient:
             and intent.kind is OrderKind.MAKER_LIMIT
             and is_post_only_reject(result)
         ):
-            logger.warning(
-                "%s post-only ADD 被拒（%s），同价再试一次 GTC，而不是市价追价",
-                intent.symbol,
-                "; ".join(collect_error_messages(result)) or result,
-            )
-            retried_gtc = True
-            retry = self._submit_entry(intent, is_buy=is_buy, size=size, tif="Gtc")
-            result = {
-                "status": "ok",
-                "order": retry,
-                "post_only_reject": result,
-                "post_only_retry": "gtc",
-            }
-            fill = extract_order_fill(retry)
+            retry_px = gtc_retry_price(is_buy, float(intent.price), self.fetch_best_bid_ask(intent.symbol))
+            if retry_px is None:
+                logger.warning(
+                    "%s post-only ADD 被拒（%s），读不到盘口，不做 GTC 重试（避免价格越过盘口）",
+                    intent.symbol,
+                    "; ".join(collect_error_messages(result)) or result,
+                )
+            else:
+                logger.warning(
+                    "%s post-only ADD 被拒（%s），以 %s 再试一次 GTC（买单不高于卖一/卖单不低于买一），而不是市价追价",
+                    intent.symbol,
+                    "; ".join(collect_error_messages(result)) or result,
+                    retry_px,
+                )
+                retried_gtc = True
+                retry = self._submit_entry(intent, is_buy=is_buy, size=size, tif="Gtc", price=retry_px)
+                result = {
+                    "status": "ok",
+                    "order": retry,
+                    "post_only_reject": result,
+                    "post_only_retry": "gtc",
+                    "post_only_retry_px": retry_px,
+                }
+                fill = extract_order_fill(retry)
 
         if fill is None or fill.size <= 0:
             # 市价本意却只 resting，或 GTC 补试未成交：撤掉本轮入场挂单，绝不挂新止损。
@@ -1283,14 +1353,49 @@ class HyperliquidClient:
         if not intent.stop_price:
             return {"status": "ok", "order": result, "stop": None}
 
-        stop_payload = self._place_protective_stop(intent, fill, is_buy=is_buy, sz_decimals=sz_decimals)
+        stop_intent = intent
+        if intent.action is IntentAction.OPEN and fill.price:
+            new_stop = stop_from_fill(intent, fill.price)
+            if abs(new_stop - float(intent.stop_price)) > 1e-12:
+                logger.info(
+                    "%s 首仓成交价 %.6g（信号价 %.6g），初始止损按成交价重算 %.6g → %.6g（止损距离不变）",
+                    intent.symbol,
+                    fill.price,
+                    intent.price,
+                    intent.stop_price,
+                    new_stop,
+                )
+                stop_intent = replace(intent, stop_price=new_stop)
+        stop_payload = self._place_protective_stop(stop_intent, fill, is_buy=is_buy, sz_decimals=sz_decimals)
         return {
             "status": "ok",
             "order": result,
             "stop": stop_payload.get("result"),
             "stop_size": stop_payload.get("size"),
             "stop_oid": stop_payload.get("oid"),
+            "stop_price": stop_intent.stop_price,
         }
+
+
+def stop_from_fill(intent: OrderIntent, fill_price: float) -> float:
+    """首仓止损按真实成交价平移：保持信号的止损距离（信号价通常是 mid/收盘价）。"""
+    stop = float(intent.stop_price or 0.0)
+    if stop <= 0 or fill_price <= 0 or intent.price <= 0:
+        return stop
+    distance = abs(float(intent.price) - stop)
+    if intent.side is Side.LONG:
+        return fill_price - distance
+    return fill_price + distance
+
+
+def gtc_retry_price(is_buy: bool, price: float, book: tuple[float, float] | None) -> float | None:
+    """post-only 被拒后的 GTC 重试价：买单不高于卖一、卖单不低于买一；无盘口返回 None。"""
+    if book is None or price <= 0:
+        return None
+    bid, ask = book
+    if is_buy:
+        return min(price, ask)
+    return max(price, bid)
 
 
 def math_floor(size: float, factor: int) -> float:
