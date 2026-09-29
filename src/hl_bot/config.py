@@ -91,6 +91,8 @@ class TrendConfig:
     starter_enabled: bool = True
     starter_frac: float = 0.35
     starter_symbols: tuple[str, ...] = ()
+    # 止损出场后，同标的同方向至少等待 N 根已收盘 4h K 线才允许再开新仓（0 = 关闭）
+    stop_cooldown_bars_4h: int = 2
 
 
 @dataclass(slots=True)
@@ -244,6 +246,7 @@ def load_config(
             starter_enabled=_as_bool(trend_raw.get("starter_enabled"), True),
             starter_frac=_as_float(trend_raw.get("starter_frac"), 0.35),
             starter_symbols=_as_list(trend_raw.get("starter_symbols"), ()),
+            stop_cooldown_bars_4h=_as_int(trend_raw.get("stop_cooldown_bars_4h"), 2),
         ),
         mean_reversion=MeanReversionConfig(
             bb_period=_as_int(mr_raw.get("bb_period"), 20),

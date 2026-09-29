@@ -119,6 +119,7 @@ class PaperBroker:
             "last_good_realized_pnl": self.account.last_good_realized_pnl,
             "last_good_day_key": self.account.last_good_day_key,
             "equity_abstraction": self.account.equity_abstraction,
+            "last_stops": self.account.last_stops,
             "positions": [
                 {
                     "symbol": p.symbol,
@@ -167,6 +168,9 @@ class PaperBroker:
             last_good_realized_pnl=float(raw.get("last_good_realized_pnl") or 0.0),
             last_good_day_key=str(raw.get("last_good_day_key") or ""),
             equity_abstraction=str(raw.get("equity_abstraction") or ""),
+            last_stops={
+                str(k): dict(v) for k, v in (raw.get("last_stops") or {}).items() if isinstance(v, dict)
+            },
         )
         if account.day_key != day_key:
             account.day_start_equity = account.equity

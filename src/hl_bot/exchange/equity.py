@@ -13,11 +13,18 @@
 公式（避免重复计数）
 --------------------
     free_spot_usdc = max(0, USDC.total - USDC.hold)
-    perps_value    = marginSummary.accountValue
+    perps_value    = marginSummary.accountValue（逐仓 = 保证金 + 未实现盈亏）
                      若 ≤0 则退回 max(crossMarginSummary.accountValue, withdrawable)
 
     unified / portfolioMargin:
-        equity = free_spot_usdc          # 不加 perps，避免同一桶 USDC 计两次
+        开逐仓时交易所把保证金从现货 USDC 里冻结为 hold（total 不变、free 变小），
+        同一笔钱以「保证金 + 未实现盈亏」出现在 perps accountValue 里。因此：
+        equity = free_spot_usdc + isolated_part + order_hold
+        isolated_part = perps_value，但只在现货 hold>0 时计入，且不超过
+                        hold + 正的未实现盈亏（+小容差），避免同一桶 USDC 计两次。
+        order_hold    = max(0, hold - (perps_value - 未实现盈亏))：挂单冻结部分加回。
+        2026-09-29 实盘核对：空仓 free=448.19；持 ETH+SOL 时 free=440.35、hold=12.12、
+        perps=12.10 → 452.45，与平仓前后连续（旧公式持仓时只算 free，少算逐仓保证金）。
         若现货为 0 而 perps>0，则用 perps（迁移残留 / 接口缺字段）
     标准账户或 abstraction 未知:
         equity = perps_value + free_spot_usdc
@@ -74,6 +81,45 @@ def free_spot_usdc(spot_state: Any) -> float:
     return 0.0
 
 
+def spot_usdc_hold(spot_state: Any) -> float:
+    """现货 USDC 被冻结的部分（unified 下包含逐仓保证金与挂单占用）。"""
+    if not isinstance(spot_state, dict):
+        return 0.0
+    balances = spot_state.get("balances")
+    if not isinstance(balances, list):
+        return 0.0
+    for item in balances:
+        if not isinstance(item, dict):
+            continue
+        coin = str(item.get("coin") or "").strip().upper()
+        if coin != "USDC" and item.get("token") != 0:
+            continue
+        return max(0.0, _as_float(item.get("hold")))
+    return 0.0
+
+
+def perps_unrealized_pnl(perps_state: Any) -> float:
+    """assetPositions 未实现盈亏之和。"""
+    if not isinstance(perps_state, dict):
+        return 0.0
+    rows = perps_state.get("assetPositions")
+    if not isinstance(rows, list):
+        return 0.0
+    total = 0.0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        pos = item.get("position") if isinstance(item.get("position"), dict) else item
+        if isinstance(pos, dict):
+            total += _as_float(pos.get("unrealizedPnl"))
+    return total
+
+
+# unified 下逐仓部分相对 hold 的容差（手续费/资金费结算造成的小差异）
+UNIFIED_ISOLATED_TOL_FRAC = 0.05
+UNIFIED_ISOLATED_TOL_ABS = 1.0
+
+
 def normalize_abstraction(value: Any) -> str | None:
     if value is None:
         return None
@@ -110,7 +156,33 @@ def combine_live_equity(
     mode = normalize_abstraction(abstraction)
 
     if is_unified_abstraction(mode):
+        hold = spot_usdc_hold(spot_state)
+        if spot > 0 and perps > 0 and hold > 0:
+            upnl = perps_unrealized_pnl(perps_state)
+            cap = hold * (1.0 + UNIFIED_ISOLATED_TOL_FRAC) + UNIFIED_ISOLATED_TOL_ABS + max(0.0, upnl)
+            isolated = min(perps, cap)
+            # hold 里超出逐仓保证金的部分是挂单占用（仍是自己的钱），加回，避免挂单期间权益被低估
+            order_hold = max(0.0, hold - max(0.0, perps - upnl))
+            return EquityBreakdown(
+                equity=spot + isolated + order_hold,
+                perps_value=perps,
+                free_spot_usdc=spot,
+                abstraction=mode,
+                formula="spot_usdc_plus_isolated_unified",
+                included=("spot_usdc", "perps_isolated"),
+            )
+        if spot > 0 and perps <= 0 and hold > 0:
+            # 空仓但有挂单冻结：冻结部分仍是账户资金
+            return EquityBreakdown(
+                equity=spot + hold,
+                perps_value=perps,
+                free_spot_usdc=spot,
+                abstraction=mode,
+                formula="spot_usdc_unified",
+                included=("spot_usdc", "spot_hold"),
+            )
         if spot > 0:
+            # 现货没有冻结（hold=0）时 perps 不是从现货划出的保证金，只计现货，防止同一桶计两次
             return EquityBreakdown(
                 equity=spot,
                 perps_value=perps,
