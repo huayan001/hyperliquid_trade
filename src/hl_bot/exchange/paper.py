@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from hl_bot.models import (
@@ -138,7 +139,11 @@ class PaperBroker:
             ],
             "resting_entries": [_resting_to_dict(item) for item in self.account.resting_entries],
         }
-        self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # 先写临时文件再替换，避免写到一半被打断后留下截断的 JSON。
+        text = json.dumps(payload, indent=2)
+        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, self.state_path)
 
     @classmethod
     def load(cls, path: str, default_equity: float, day_key: str, week_key: str) -> PaperBroker:

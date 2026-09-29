@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -266,6 +269,45 @@ def is_rate_limit_error(exc: BaseException | None) -> bool:
             return True
         text = str(current).lstrip()
         if text.startswith("(429,") or text.startswith("(429 ") or "HTTP 429" in text:
+            return True
+        nxt = current.__cause__ if current.__cause__ is not None else current.__context__
+        current = nxt if nxt is not current else None
+    return False
+
+
+def _is_http_server_error(exc: BaseException) -> bool:
+    if not isinstance(exc, urllib.error.HTTPError):
+        return False
+    code = exc.code
+    return isinstance(code, int) and 500 <= code <= 599
+
+
+def _is_direct_transient_network_error(exc: BaseException) -> bool:
+    """单层异常是否属于可重试的传输/5xx。HTTPError 必须先于 URLError 判断（前者是后者的子类）。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        return _is_http_server_error(exc)
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    return isinstance(
+        exc,
+        (
+            ssl.SSLError,
+            http.client.RemoteDisconnected,
+            http.client.IncompleteRead,
+            ConnectionResetError,
+            TimeoutError,
+            socket.timeout,
+        ),
+    )
+
+
+def is_transient_network_error(exc: BaseException | None) -> bool:
+    """传输闪断、超时或 HTTP 5xx，含异常链。不含 429（走 RateLimitError）。"""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_direct_transient_network_error(current):
             return True
         nxt = current.__cause__ if current.__cause__ is not None else current.__context__
         current = nxt if nxt is not current else None
@@ -552,7 +594,23 @@ class HyperliquidClient:
                         delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
                         continue
                     raise RateLimitError(f"Hyperliquid /info HTTP 429: {body}") from exc
+                if _is_http_server_error(exc) and attempt < _RATE_LIMIT_ATTEMPTS:
+                    logger.warning("/info HTTP %s，%.1fs 后重试", exc.code, delay)
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+                    continue
                 raise RuntimeError(f"Hyperliquid /info HTTP {exc.code}: {body}") from exc
+            except Exception as exc:
+                # /info 只读，传输层错误（含读响应时的 SSL EOF）可以安全重试。解析错误不重试。
+                if not _is_direct_transient_network_error(exc):
+                    raise
+                last_error = exc
+                if attempt < _RATE_LIMIT_ATTEMPTS:
+                    logger.warning("/info 传输错误，%.1fs 后重试: %s", delay, exc)
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
+                    continue
+                raise
             actual = info_weight(payload, raw)
             self.throttle.adjust_info(actual - estimate)
             self.budget.record(name, actual)
@@ -629,6 +687,12 @@ class HyperliquidClient:
         info._hl_info_throttled = True
 
     def _install_exchange_throttle(self, exchange: Any) -> None:
+        """给 SDK /exchange 计数。不下单重试。
+
+        下单、撤单、改杠杆都走这里。传输错误（例如读响应时 SSL EOF）无法证明请求没到交易所，
+        自动重试可能重复下单或重复撤单。因此保持原语义：失败即抛出，由调用方决定是否再发。
+        只读的 /info 在 _post_info 里退避重试。
+        """
         if getattr(exchange, "_hl_exchange_throttled", False):
             return
         original = exchange.post

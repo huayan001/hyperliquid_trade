@@ -19,6 +19,7 @@ from hl_bot.exchange.client import (
     is_reduce_only_stop_order,
     order_trigger_px,
     is_rate_limit_error,
+    is_transient_network_error,
     normalize_px,
     order_is_buy,
     order_limit_px,
@@ -1221,12 +1222,19 @@ class BotRunner:
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
-                if not is_rate_limit_error(exc):
-                    raise
-                logger.warning("本轮扫描遇到 429，%.1fs 后重试，进程不退出: %s", backoff, exc)
-                time.sleep(backoff)
-                backoff = min(backoff * 2.0, 120.0)
-                continue
+                if is_rate_limit_error(exc):
+                    logger.warning("本轮扫描遇到 429，%.1fs 后重试，进程不退出: %s", backoff, exc)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2.0, 120.0)
+                    continue
+                if is_transient_network_error(exc):
+                    # 重试已在 _post_info 用尽。这里不落盘：scan_once 抛出时末尾的 persist 不会执行，
+                    # 中途已完成的 broker.save() 各自是整份快照（原子替换）。
+                    wait = max(5, self.cfg.poll_seconds)
+                    logger.exception("本轮扫描遇到网络错误，跳过本轮，%.1fs 后继续: %s", wait, exc)
+                    time.sleep(wait)
+                    continue
+                raise
             print(format_report(report), flush=True)
             backoff = 2.0
             time.sleep(max(5, self.cfg.poll_seconds))
