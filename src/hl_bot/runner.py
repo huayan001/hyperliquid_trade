@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 from hl_bot.alerts import AlertSink
 from hl_bot.btc_regime import BtcRegimeGate, shadow_log_path
@@ -18,6 +20,7 @@ from hl_bot.exchange.client import (
     is_open_entry_order,
     is_reduce_only_stop_order,
     order_trigger_px,
+    is_http_timeout,
     is_rate_limit_error,
     is_transient_network_error,
     normalize_px,
@@ -97,6 +100,23 @@ class ScanReport:
     skipped: list[str] = field(default_factory=list)
     # 账户级状态，例如趋势日亏损停开仓；每轮报告都会打印
     status: list[str] = field(default_factory=list)
+
+
+def note_scan_complete() -> None:
+    """成功扫完一轮才更新标记。watchdog 用文件 mtime 判断扫描是否卡住。
+
+    只在扫描返回后写。卡在 HTTP 读上的那一轮不会更新它。
+    阈值在 scripts/live_scan_stall.sh（默认 40 分钟），正常 15 分钟间隔不会被当成卡住。
+    """
+    path = Path(os.environ.get("HL_SCAN_OK_FILE", "logs/live_scan.ok"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tmp.write_text(stamp + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("写入扫描完成标记失败: %s", exc)
 
 
 def _utc_keys(now: datetime | None = None) -> tuple[str, str, int]:
@@ -1247,11 +1267,18 @@ class BotRunner:
                 if is_transient_network_error(exc):
                     # 重试已在 _post_info 用尽。这里不落盘：scan_once 抛出时末尾的 persist 不会执行，
                     # 中途已完成的 broker.save() 各自是整份快照（原子替换）。
+                    # 超时同样跳过本轮继续扫，不退出进程，也不把这一轮记成成功扫描。
                     wait = max(5, self.cfg.poll_seconds)
-                    logger.exception("本轮扫描遇到网络错误，跳过本轮，%.1fs 后继续: %s", wait, exc)
+                    if is_http_timeout(exc):
+                        logger.exception("本轮扫描遇到 HTTP 超时，跳过本轮，%.1fs 后继续: %s", wait, exc)
+                    else:
+                        logger.exception("本轮扫描遇到网络错误，跳过本轮，%.1fs 后继续: %s", wait, exc)
                     time.sleep(wait)
                     continue
                 raise
+            if not self.cfg.dry_run:
+                note_scan_complete()
+            logger.info("扫描完成")
             print(format_report(report), flush=True)
             backoff = 2.0
             time.sleep(max(5, self.cfg.poll_seconds))

@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # 实盘 watchdog：拉起 `python -m hl_bot run --live`，子进程退出后指数退避重启。
 # 每 HEARTBEAT_S 秒写心跳文件；子进程退出时明确记录退出码 / 信号。
+# 心跳只能说明 watchdog 自己还在。扫描线程卡在 HTTP 读上时，心跳照样刷新。
+# 因此另看 logs/live_scan.ok：超过约 40 分钟没有成功扫完，就杀掉卡住的 python 并立刻拉起。
 # 时间戳显式使用 Asia/Shanghai（+08:00），不依赖系统时区。
 set -uo pipefail
 ROOT="/workspace/hyperliquid_trade"
 cd "$ROOT" || exit 1
 mkdir -p logs state
+# shellcheck source=live_scan_stall.sh
+source "$ROOT/scripts/live_scan_stall.sh" || exit 1
 HEARTBEAT_FILE="$ROOT/logs/live_watchdog.heartbeat"
 HEARTBEAT_S="${HL_WATCHDOG_HEARTBEAT_S:-30}"
+export HL_SCAN_OK_FILE="${HL_SCAN_OK_FILE:-$ROOT/logs/live_scan.ok}"
+export HL_SCAN_STALL_S="${HL_SCAN_STALL_S:-2400}"
 
 ts() { TZ=Asia/Shanghai date -Iseconds "$@"; }
 
@@ -56,15 +62,30 @@ while true; do
   child=$!
   echo "$(ts) child pid=$child started" >> logs/live_run.log
   heartbeat running
+  stalled=0
   while kill -0 "$child" 2>/dev/null; do
     # 后台 sleep + wait，保证 TERM 能即时打断
     sleep "$HEARTBEAT_S" &
     wait $! 2>/dev/null
     heartbeat running
+    if scan_is_stalled "$started"; then
+      age=$(scan_stall_age "$started")
+      echo "$(ts) scan stalled: no successful complete scan for ${age}s (threshold $(scan_stall_seconds)s, marker=$(scan_ok_file)); killing hung child=$child" >> logs/live_run.log
+      stalled=1
+      kill_hung_pid "$child"
+      break
+    fi
   done
   wait "$child"
   code=$?
   ran=$(( $(date +%s) - started ))
+  child=""
+  if [ "$stalled" = 1 ]; then
+    heartbeat "stalled"
+    echo "$(ts) hung child killed after scan stall (wait status=$code, ran ${ran}s); relaunching now" >> logs/live_run.log
+    backoff=60
+    continue
+  fi
   if [ "$code" -gt 128 ]; then
     signum=$(( code - 128 ))
     signame=$(kill -l "$signum" 2>/dev/null || echo "?")
@@ -72,7 +93,6 @@ while true; do
   else
     why="exit code $code"
   fi
-  child=""
   heartbeat "exited:$code"
   echo "$(ts) exited code=$code ($why) after ${ran}s; sleep ${backoff}s" >> logs/live_run.log
   # 跑满 1 小时视为健康，退避重置
