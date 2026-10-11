@@ -255,6 +255,19 @@ _RATE_LIMIT_BASE_DELAY = 2.0
 _RATE_LIMIT_MAX_DELAY = 60.0
 # SDK Info 路径抛出的 429 没有内置退避；REST 路径由 _post_info 自己重试
 _SDK_INFO_RETRIES = 2
+# 官方 SDK 默认 timeout=None。读超时不设上限时，半开的 HTTPS 会停在 CLOSE-WAIT，扫描循环永远不返回。
+HTTP_TIMEOUT_S = 20
+
+# requests / urllib3 的超时类型不是内置 TimeoutError。按类名识别，避免把 429 ClientError 算进来。
+_TIMEOUT_TYPE_NAMES = frozenset(
+    {
+        "Timeout",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "ReadTimeoutError",
+        "ConnectTimeoutError",
+    }
+)
 
 
 def is_rate_limit_error(exc: BaseException | None) -> bool:
@@ -282,10 +295,39 @@ def _is_http_server_error(exc: BaseException) -> bool:
     return isinstance(code, int) and 500 <= code <= 599
 
 
+def _is_timeout_type(exc: BaseException) -> bool:
+    """这一层异常是不是读/连接超时。不含异常链。"""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    typ = type(exc)
+    module = typ.__module__ or ""
+    if typ.__name__ in _TIMEOUT_TYPE_NAMES and ("requests" in module or "urllib3" in module):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException) and reason is not exc:
+        return _is_timeout_type(reason)
+    return False
+
+
+def is_http_timeout(exc: BaseException | None) -> bool:
+    """传输超时（含 requests/urllib3 的 ReadTimeout），沿异常链识别。"""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_timeout_type(current):
+            return True
+        nxt = current.__cause__ if current.__cause__ is not None else current.__context__
+        current = nxt if nxt is not current else None
+    return False
+
+
 def _is_direct_transient_network_error(exc: BaseException) -> bool:
     """单层异常是否属于可重试的传输/5xx。HTTPError 必须先于 URLError 判断（前者是后者的子类）。"""
     if isinstance(exc, urllib.error.HTTPError):
         return _is_http_server_error(exc)
+    if _is_timeout_type(exc):
+        return True
     if isinstance(exc, urllib.error.URLError):
         return True
     return isinstance(
@@ -516,6 +558,47 @@ def _message_is_rate_limit(message: str) -> bool:
     return "429" in text or "rate limit" in low or "too many requests" in low
 
 
+def _bind_http_timeout(api: Any, timeout: float = HTTP_TIMEOUT_S) -> None:
+    """给 SDK 的 requests.Session 套上有限超时。
+
+    官方 API.post 使用 timeout=self.timeout，构造时默认 None。读超时为 None 时，
+    半开连接会一直停在 recv，扫描线程不再写 live_run.log。这里把 None 换成约 20 秒，
+    并在超时后丢掉这条连接，下一笔请求重新握手。下单路径不在这里重试。
+    """
+    if api is None:
+        return
+    current = getattr(api, "timeout", None)
+    if not isinstance(current, (int, float)) or current <= 0:
+        try:
+            api.timeout = timeout
+        except Exception:
+            logger.debug("无法写入 SDK timeout", exc_info=True)
+    session = getattr(api, "session", None)
+    if session is None or getattr(session, "_hl_timeout_bound", False):
+        return
+    original = session.request
+
+    def request(method: str, url: str, **kwargs: Any) -> Any:
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = timeout
+        try:
+            return original(method, url, **kwargs)
+        except BaseException as exc:
+            if is_http_timeout(exc):
+                logger.warning("Hyperliquid HTTP 超时（%.0fs，已中止以免卡住扫描）: %s", timeout, exc)
+                try:
+                    session.close()
+                except Exception:
+                    logger.debug("关闭超时连接失败", exc_info=True)
+            raise
+
+    session.request = request
+    try:
+        session._hl_timeout_bound = True
+    except Exception:
+        logger.debug("无法标记 SDK session 已设置超时", exc_info=True)
+
+
 @dataclass(slots=True)
 class AccountSnapshot:
     """一轮扫描里共享的账户读数。perps_raw 同时给权益和持仓用，避免再打一次 clearinghouseState。"""
@@ -581,7 +664,7 @@ class HyperliquidClient:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=20) as resp:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
                     raw = json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
@@ -645,6 +728,7 @@ class HyperliquidClient:
         self._spot_meta = spot_meta
         info = Info(url, skip_ws=True, meta=meta, spot_meta=spot_meta)
         self._install_info_throttle(info)
+        _bind_http_timeout(info)
         return info
 
     def _build_exchange(self, url: str, account: Any, address: str) -> Any:
@@ -659,6 +743,8 @@ class HyperliquidClient:
         )
         self._install_info_throttle(exchange.info)
         self._install_exchange_throttle(exchange)
+        _bind_http_timeout(exchange)
+        _bind_http_timeout(getattr(exchange, "info", None))
         return exchange
 
     def _install_info_throttle(self, info: Any) -> None:
@@ -897,7 +983,15 @@ class HyperliquidClient:
                     time.sleep(delay)
                     delay = min(delay * 2.0, _RATE_LIMIT_MAX_DELAY)
                     continue
-                logger.warning("读取%s失败: %s", label, exc)
+                if is_http_timeout(exc):
+                    logger.warning(
+                        "读取%s超时（%.0fs），沿用已有缓存/回退，扫描继续: %s",
+                        label,
+                        HTTP_TIMEOUT_S,
+                        exc,
+                    )
+                else:
+                    logger.warning("读取%s失败: %s", label, exc)
                 return None, f"{label}: {exc}"
 
     def fetch_account_snapshot(self) -> AccountSnapshot:
