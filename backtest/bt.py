@@ -771,8 +771,10 @@ VERSIONS = [
     Params("V3 V0+吊灯保本", "v3", cooldown_4h=0, partial_r=None, be_r=1.0, trail_atr=2.0),
 ]
 
-# 对齐实盘配置（config.py）：趋势最多 3 仓、组合止损风险 ≤6%、BTC 空头风险 ×0.7、均值回归另计最多 2 仓；
-# 止损后冷却 2 根 4h 已是实盘默认值。未建模：日/周回撤降杠杆、资金费逆向减仓、maker 挂单可能不成交、追突破市价。
+# 对齐实盘配置（config.py）：趋势最多 3 仓、组合止损风险 ≤6%、BTC 空头风险 ×0.7、均值回归另计最多 2 仓。
+# 本引擎的止损冷却仍是 2 根 4h，也没有「止损后日线收盘重回 EMA20」再入场过滤。
+# 实盘 config.toml 现为 stop_cooldown_bars_4h=6，过滤在 runner.post_stop_reclaim_reason。
+# 未建模：日/周回撤降杠杆、资金费逆向减仓、maker 挂单可能不成交、追突破市价。
 LIVE_CC = dict(maxpos_trend=3, maxpos_mr=2, port_risk=0.06, btc_short_mult=0.7, cooldown_4h=2)  # cc 原口径（dataclass 默认值）
 # FIX：实盘进程实际加载 config.toml（L39-40 max_positions=2 / portfolio_risk_max=0.04；[mean_reversion] L77-79 max_positions=1、
 # max_trades_per_symbol_day=3、daily_loss_halt=0.02），dataclass 默认值 3/6%/2/4/3% 被覆盖；另外建模日 5%/周 10% 降杠杆与实盘冷却口径

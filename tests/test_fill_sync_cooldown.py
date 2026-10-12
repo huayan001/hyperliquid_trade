@@ -360,6 +360,7 @@ def test_ghost_fill_query_failure_defers_then_clears(tmp_path) -> None:
 
 def test_stop_cooldown_blocks_same_side_for_two_closed_4h_bars(tmp_path) -> None:
     runner = _runner(tmp_path)
+    runner.cfg.trend.stop_cooldown_bars_4h = 2
     stop_ts = 10 * FOUR_HOURS_MS + HOUR  # 某根 4h K 线中途止损
     runner._record_stop("SOL", Side.LONG, 112.5, -10.0, stop_ts)
     assert runner.stop_cooldown_reason("SOL", Side.LONG, stop_ts + 10 * 60_000)
@@ -371,6 +372,16 @@ def test_stop_cooldown_blocks_same_side_for_two_closed_4h_bars(tmp_path) -> None
     assert runner.stop_cooldown_reason("SOL", Side.SHORT, stop_ts + 60_000) is None
     # 其他标的不受影响
     assert runner.stop_cooldown_reason("ETH", Side.LONG, stop_ts + 60_000) is None
+
+
+def test_stop_cooldown_default_holds_through_two_bars(tmp_path) -> None:
+    runner = _runner(tmp_path)
+    assert runner.cfg.trend.stop_cooldown_bars_4h == 6
+    stop_ts = 10 * FOUR_HOURS_MS + HOUR
+    runner._record_stop("SOL", Side.LONG, 112.5, -10.0, stop_ts)
+    # 只收了 2 根 4h 仍在冷却；收满 6 根才放行
+    assert runner.stop_cooldown_reason("SOL", Side.LONG, 13 * FOUR_HOURS_MS)
+    assert runner.stop_cooldown_reason("SOL", Side.LONG, 17 * FOUR_HOURS_MS) is None
 
 
 def test_stop_cooldown_configurable_and_persisted(tmp_path) -> None:
@@ -407,11 +418,11 @@ def test_bot_hard_stop_close_records_cooldown(tmp_path) -> None:
     assert runner.account.last_stops["SOL"]["ts"] == 5_000
 
 
-def test_config_default_cooldown_is_two_bars() -> None:
+def test_config_default_cooldown_is_six_bars() -> None:
     from hl_bot.config import load_config
 
-    assert BotConfig().trend.stop_cooldown_bars_4h == 2
-    assert load_config().trend.stop_cooldown_bars_4h == 2
+    assert BotConfig().trend.stop_cooldown_bars_4h == 6
+    assert load_config().trend.stop_cooldown_bars_4h == 6
 
 
 # ---------------------------------------------------------------- 4. equity

@@ -95,8 +95,8 @@ class TrendConfig:
     starter_enabled: bool = True
     starter_frac: float = 0.35
     starter_symbols: tuple[str, ...] = ()
-    # 止损出场后，同标的同方向至少等待 N 根已收盘 4h K 线才允许再开新仓（0 = 关闭）
-    stop_cooldown_bars_4h: int = 2
+    # 止损出场后，同标的同方向至少等待 N 根已收盘 4h K 线才允许再开新仓（0 = 关闭）。6 根约 24h。
+    stop_cooldown_bars_4h: int = 6
     # BTC 日线 ADX 开关。off 不拉行情、不改任何订单；shadow 只记日志；enforce 才跳过新趋势开仓。
     btc_regime_mode: str = "off"
     btc_regime_adx_min: float = 23.35
@@ -280,7 +280,7 @@ def load_config(
             starter_enabled=_as_bool(trend_raw.get("starter_enabled"), True),
             starter_frac=_as_float(trend_raw.get("starter_frac"), 0.35),
             starter_symbols=_as_list(trend_raw.get("starter_symbols"), ()),
-            stop_cooldown_bars_4h=_as_int(trend_raw.get("stop_cooldown_bars_4h"), 2),
+            stop_cooldown_bars_4h=_as_int(trend_raw.get("stop_cooldown_bars_4h"), 6),
             btc_regime_mode=_parse_btc_regime_mode(trend_raw.get("btc_regime_mode")),
             btc_regime_adx_min=_parse_btc_regime_adx_min(trend_raw.get("btc_regime_adx_min")),
             btc_regime_adx_period=_parse_btc_regime_period(trend_raw.get("btc_regime_adx_period")),

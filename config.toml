@@ -59,8 +59,9 @@ starter_enabled = true
 starter_frac = 0.35
 # 空列表 = 所有趋势标的；可写成 ["BTC", "ETH"] 只对部分品种启用
 starter_symbols = []
-# 止损出场后同标的同方向冷却：至少等 N 根已收盘 4h K 线（0 = 关闭）
-stop_cooldown_bars_4h = 2
+# 止损出场后同标的同方向冷却：至少等 N 根已收盘 4h K 线（0 = 关闭）。6 根约 24h。
+# 冷却结束后，同向趋势新开仓仍要等止损之后的日线收盘重回 EMA20（多在上方、空在下方）。
+stop_cooldown_bars_4h = 6
 # BTC 日线 ADX 开关：off 不拉取、不改订单；shadow 只记录不拦截；enforce 低于阈值时跳过新趋势开仓
 # （不含加仓、止损、离场、均值回归）。当前先 shadow 观察 4–8 周。
 btc_regime_mode = "shadow"

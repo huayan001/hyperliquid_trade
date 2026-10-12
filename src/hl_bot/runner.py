@@ -279,12 +279,19 @@ class BotRunner:
                 notes.append("中间地带/冲突：不新开仓")
 
             cooldown = None
+            reclaim_block = None
             if signal is not None and existing is None and not closing:
                 cooldown = self.stop_cooldown_reason(symbol, signal.side, now_ms)
                 if cooldown:
                     notes.append(f"止损冷却拒绝：{cooldown}")
                     logger.info("%s 新开仓被止损冷却拒绝：%s", symbol, cooldown)
-            if signal is not None and existing is None and not closing and not cooldown:
+                elif signal.strategy is StrategyName.TREND:
+                    # 只挡趋势新开仓。均值回归不看 EMA20 收回；已有仓的补仓/金字塔走上面的分支。
+                    reclaim_block = self.post_stop_reclaim_reason(symbol, signal.side, market, now_ms)
+                    if reclaim_block:
+                        notes.append(f"止损后再入场拒绝：{reclaim_block}")
+                        logger.info("%s 新开仓被止损后再入场过滤拒绝：%s", symbol, reclaim_block)
+            if signal is not None and existing is None and not closing and not cooldown and not reclaim_block:
                 against = funding_against(signal.side, market.funding.hourly_rate)
                 huge_funding = (
                     against
@@ -895,6 +902,20 @@ class BotRunner:
             "pnl": float(pnl),
             "label": label,
         }
+
+    def post_stop_reclaim_reason(
+        self,
+        symbol: str,
+        side: Side,
+        market: MarketSnapshot,
+        now_ms: int,
+    ) -> str | None:
+        """同标的同向止损之后，日线收盘尚未重回 EMA20 时拒绝新的趋势开仓。"""
+        rec = self.account.last_stops.get(symbol.upper())
+        if not rec or str(rec.get("side") or "") != side.value:
+            return None
+        stop_ts = int(rec.get("ts") or 0)
+        return self.trend.post_stop_reclaim_block(market, side, stop_ts, now_ms)
 
     def stop_cooldown_reason(self, symbol: str, side: Side, now_ms: int) -> str | None:
         """止损后同标的同方向：至少再收 N 根 4h K 线才允许新开仓。"""
