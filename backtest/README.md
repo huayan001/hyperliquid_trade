@@ -55,6 +55,7 @@ python make_report_long.py                   # → report_long_tables.md
 
 ## 注意事项
 
+- **止损后再入场过滤还没进这个引擎**。实盘 `config.toml` 的 `stop_cooldown_bars_4h` 已是 6，同向趋势新开仓还要等止损之后的日线收盘重回 EMA20（`runner.post_stop_reclaim_reason`）。下面的 L0 仍按冷却 2 根、没有这道过滤来跑。因此现在执行 `python bt.py` 不能当作这次改动的前后对比。K 线不在仓库里：`python fetch.py` 会打 Hyperliquid `/info`（和实盘共用 IP 限速）；长周期用 `python fetch_long.py`，再 `BT_DATA=long BT_SYMS=BTC,ETH,SOL,HYPE python bt.py`。
 - 均值回归在实盘逻辑下几乎不触发（HL 6 个月 0 笔，长周期 3 年 1–2 笔），MR 相关版本和非 MR 版本结果基本相同。
 - 未建模：资金费逆向减仓、maker 挂单不成交（MR 限价按穿价即成交，开盘越过限价时按开盘价成交但仍计 maker 费）、突破追单市价、交易所强平（只用止损距离 ≤5% 近似）。
 - V4 的 1.5R/3R 分批目标以加仓后的新均价计算。

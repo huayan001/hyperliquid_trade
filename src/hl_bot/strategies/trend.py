@@ -1,4 +1,8 @@
-"""趋势跟踪波段（v1.1）：日线确认可先 starter，4h Donchian 收盘突破补满；禁止等 EMA 回撤。"""
+"""趋势跟踪波段（v1.1）：日线确认可先 starter，4h Donchian 收盘突破补满；禁止等 EMA 回撤。
+
+同向止损之后的新开仓另计一道过滤（由 runner 调用）：必须出现止损之后的日线收盘重回 EMA20。
+已有仓的突破补仓和金字塔不加这道过滤，补仓仍只等 4h Donchian 收盘突破。
+"""
 
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ class TrendStrategy(Strategy):
         existing: Position | None = None,
     ) -> Signal | None:
         # 已有仓不得再发满仓开仓信号；starter 补仓走 generate_breakout_add。
+        # 首仓仍可以只凭日线趋势开 starter。同向止损后的 EMA20 收回过滤在 runner，不放进这里。
         if existing is not None:
             return None
         prepared = self._prepare(market, decision, now_ms)
@@ -165,6 +170,47 @@ class TrendStrategy(Strategy):
         if side is Side.LONG:
             return last.close > upper
         return last.close < lower
+
+    def post_stop_reclaim_block(
+        self,
+        market: MarketSnapshot,
+        side: Side,
+        stop_ts: int | None,
+        now_ms: int | None = None,
+    ) -> str | None:
+        """同向止损之后，最近一根止损后收盘的日线必须重回 EMA（多在上、空在下），才允许新开仓。
+
+        返回拒绝原因；可以再开则返回 None。没有止损记录时不拦截。
+        止损前已经收盘的日线不算「重回」。相等不算站上/站下。
+        """
+        if stop_ts is None or stop_ts <= 0:
+            return None
+        period = self.cfg.ema_fast
+        daily = last_closed(market.daily, now_ms)
+        symbol = market.symbol
+        if len(daily) < period:
+            return (
+                f"{symbol} {side.value} 止损后已收盘日线不足 {period} 根，"
+                f"无法确认 EMA{period} 收回，拒绝同向再开"
+            )
+        last = daily[-1]
+        if last.end_ts <= stop_ts:
+            return (
+                f"{symbol} {side.value} 止损后还没有新的日线收盘，"
+                f"不能把止损前的收盘当作 EMA{period} 收回，拒绝同向再开"
+            )
+        ema_v = last_value(ema([c.close for c in daily], period))
+        if ema_v is None:
+            return f"{symbol} {side.value} 日线 EMA{period} 不可用，拒绝同向再开"
+        close = last.close
+        reclaimed = close > ema_v if side is Side.LONG else close < ema_v
+        if reclaimed:
+            return None
+        need = "上方" if side is Side.LONG else "下方"
+        return (
+            f"{symbol} {side.value} 最近一根已收盘日线 {close:.6g} "
+            f"尚未回到 EMA{period}={ema_v:.6g} {need}，拒绝同向再开"
+        )
 
     def _starter_allowed_for(self, symbol: str) -> bool:
         if not self.cfg.starter_enabled:
