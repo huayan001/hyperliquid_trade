@@ -137,6 +137,23 @@ hl-bot version
 
 `--live` 必须与 `HL_ENABLE_LIVE=1` 同时出现。
 
+## 实盘保活
+
+`scripts/ensure_live.sh` 由外部定时调用，`scripts/live_watchdog.sh` 负责拉起 `python -m hl_bot run --live`。下面两种「看起来还活着」都会走同一条重启（先 TERM，几秒后仍在则 KILL，再拉起 watchdog）：
+
+| 闸 | 默认 | 环境变量 | 什么时候触发 |
+|---|---|---|---|
+| 心跳过期 | 180 秒（3 分钟） | `HL_HB_STALE_S` | watchdog 大约每 30 秒写一次 `logs/live_watchdog.heartbeat`。进程还在，但这份文件已经超过阈值没更新 |
+| 扫描停滞 | 2400 秒（40 分钟） | `HL_SCAN_STALL_S` | 心跳可能仍新鲜，但 `logs/live_scan.ok` 久未在成功扫描后更新 |
+
+心跳周期是 `HL_WATCHDOG_HEARTBEAT_S`（默认 30 秒）。有效心跳阈值是 `max(配置, 3 × 心跳周期, 90 秒)`：一次调度抖动不会重启；把周期调得很长时，也不会每一拍都被当成故障。设 `HL_HB_STALE_S=120` 就是 2 分钟。刚启动、还没活过该阈值的 watchdog，不会因为上一份旧心跳文件被误杀。读不到进程启动时间时，这一闸放过（扫描闸仍在）。
+
+整机或 watchdog 的 `sleep` 若一次就超过同一阈值，watchdog 自己会杀掉子进程并立刻拉起，不必干等 40 分钟，也不必等下一次 `ensure_live`。
+
+`HL_ENSURE_DRY_RUN=1` 只把判定写进 `logs/ensure_live.log`，不发信号。这些变量可以放在环境里，也可以写在 `.env`（保活脚本只读取上面三个数字，不会 `source` 私钥）。
+
+`/proc/stat` 的开机时刻若漂移，日志里可能出现一行 `box rebooted`。那一行只作记录，不会因此重启。
+
 ## 实现要点（v1.1）
 
 - 趋势突破用 **4h 收盘价** 相对前 20 根 Donchian，不用影线，也**不会**等待回踩 EMA。

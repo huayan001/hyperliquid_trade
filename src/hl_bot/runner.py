@@ -107,6 +107,7 @@ def note_scan_complete() -> None:
 
     只在扫描返回后写。卡在 HTTP 读上的那一轮不会更新它。
     阈值在 scripts/live_scan_stall.sh（默认 40 分钟），正常 15 分钟间隔不会被当成卡住。
+    心跳停更是另一道闸（scripts/live_heartbeat.sh，默认 3 分钟），不看这个文件。
     """
     path = Path(os.environ.get("HL_SCAN_OK_FILE", "logs/live_scan.ok"))
     try:
