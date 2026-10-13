@@ -2,7 +2,8 @@
 # 实盘进程只有在一轮扫描成功返回后才更新 HL_SCAN_OK_FILE（默认 $ROOT/logs/live_scan.ok）。
 # 子进程已经跑了、并且「这次启动之后」超过 HL_SCAN_STALL_S（默认 2400 秒 = 40 分钟）
 # 仍没有成功扫描，就当成卡住。正常 15 分钟一轮不会触发。
-# 心跳文件不能用来判断这个：它是 watchdog 自己写的，扫描线程卡死时心跳照样刷新。
+# 新鲜心跳不能代替这个判定：心跳是 watchdog 写的，扫描线程卡死时心跳仍会刷新。
+# 心跳本身停更（循环没在写）由 live_heartbeat.sh 另判，默认大约 3 分钟。
 
 scan_stall_seconds() {
   printf '%s\n' "${HL_SCAN_STALL_S:-2400}"

@@ -14,6 +14,7 @@ from hl_bot.runner import BotRunner, ScanReport, note_scan_complete
 
 ROOT = Path(__file__).resolve().parents[1]
 STALL = ROOT / "scripts" / "live_scan_stall.sh"
+HEARTBEAT = ROOT / "scripts" / "live_heartbeat.sh"
 WATCHDOG = ROOT / "scripts" / "live_watchdog.sh"
 ENSURE = ROOT / "scripts" / "ensure_live.sh"
 
@@ -41,7 +42,7 @@ def _stall_rc(child_start: int, marker: Path, stall_s: int = 2400) -> int:
 
 
 def test_shell_scripts_parse() -> None:
-    for path in (STALL, WATCHDOG, ENSURE):
+    for path in (STALL, HEARTBEAT, WATCHDOG, ENSURE):
         subprocess.run(["bash", "-n", str(path)], check=True)
 
 
