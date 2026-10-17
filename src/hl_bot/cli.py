@@ -16,14 +16,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=("scan", "run", "version"),
-        help="scan=拉一次行情并打印意图；run=循环；version=版本号",
+        choices=("scan", "run", "version", "phil-ali"),
+        help="scan=拉一次行情并打印意图；run=循环；version=版本号；phil-ali=菲阿里四价（默认关闭）",
     )
     parser.add_argument("--config", default=None, help="config.toml 路径")
     parser.add_argument("--network", choices=("mainnet", "testnet"), default=None)
     parser.add_argument("--symbols", default=None, help="逗号分隔，如 BTC,ETH")
     parser.add_argument("--live", action="store_true", help="实盘下单（还需 HL_ENABLE_LIVE=1）")
     parser.add_argument("--interval", type=int, default=None, help="run 轮询秒数，覆盖配置")
+    parser.add_argument("--loop", action="store_true", help="仅 phil-ali：按 HL_PHIL_ALI_POLL_SECONDS 循环")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -38,6 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "version":
         print(__version__)
         return 0
+    if args.command == "phil-ali":
+        # 在加载趋势配置、构造 BotRunner 之前返回。关闭时不拉行情、不下单。
+        from hl_bot.phil_ali.cli import run_phil_ali
+
+        return run_phil_ali(loop=bool(args.loop), cli_live=bool(args.live))
 
     cfg = load_config(
         args.config,
