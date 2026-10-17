@@ -14,6 +14,7 @@ build/
 state/*.json
 state/*.jsonl
 state/candles/
+state/phil_ali/
 !state/.gitkeep
 .idea/
 .vscode/
@@ -28,3 +29,7 @@ backtest/results*.pkl
 backtest/**/*.pkl
 backtest/trend_D/*.pkl
 backtest/__pycache__/
+backtest/phil_ali/data/
+backtest/phil_ali/out/trades_*.json
+backtest/phil_ali/out/*.png
+backtest/phil_ali/out/REPORT.md

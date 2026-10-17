@@ -36,6 +36,8 @@ class Regime(str, Enum):
 class StrategyName(str, Enum):
     TREND = "trend"
     MEAN_REVERSION = "mean_reversion"
+    # 菲阿里四价走独立入口，趋势主循环不会创建这种仓位。
+    PHIL_ALI = "phil_ali"
 
 
 class OrderKind(str, Enum):

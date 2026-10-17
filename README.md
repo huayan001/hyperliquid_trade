@@ -50,10 +50,12 @@ src/hl_bot/
   regime.py                    环境路由
   strategies/trend.py          趋势跟踪
   strategies/mean_reversion.py 均值回归
+  phil_ali/                    菲阿里四价（独立入口，默认关闭）
   risk.py                      仓位与组合限制
   exchange/client.py           Hyperliquid REST + SDK
   exchange/equity.py           实盘权益（对齐 App「可用」；纸盘不走这里）
   runner.py / cli.py           扫描与循环
+backtest/phil_ali/             菲阿里纯规则回测（仅 BTC/ETH/SOL）
 config.toml                    可调参数（不要把密钥写进来）
 .env.example                   环境变量模板
 ```
@@ -105,6 +107,12 @@ Hyperliquid 推荐大多数用户使用 **unified account**：现货 USDC 与永
 
 dry-run / `hl-bot run` 纸盘仍用 `HL_PAPER_EQUITY` 与 `state/paper_state.json`，不走该公式。
 
+## 菲阿里四价（默认关闭）
+
+另一套纯规则：昨天高低突破，UTC 日末平仓，只做加密货币。`hl-bot scan` / `hl-bot run` 不会进入这套逻辑，保活脚本也不会拉起它。`HL_PHIL_ALI_ENABLED` 默认是 `0`，这时候 `hl-bot phil-ali` 只打印未启用并退出。
+
+规则、纸面/影子、以后若要发单需要的五道闸，以及「不要写进日本 VPS 保活」见 [docs/phil_ali.md](docs/phil_ali.md)。回测在 [backtest/phil_ali/README.md](backtest/phil_ali/README.md)。黄金不在范围内。
+
 ## 建议顺序：dry-run → 测试网 → 主网
 
 1. **dry-run / 主网公开数据**（上面第一次运行）。确认能拉到 BTC/ETH/SOL/HYPE 的 K 线，制度与信号解释符合文档。
@@ -133,6 +141,7 @@ dry-run / `hl-bot run` 纸盘仍用 `HL_PAPER_EQUITY` 与 `state/paper_state.jso
 hl-bot scan [--network mainnet|testnet] [--symbols BTC,ETH]
 hl-bot run [--interval 60]
 hl-bot version
+hl-bot phil-ali          # 默认关闭，不会下单
 ```
 
 `--live` 必须与 `HL_ENABLE_LIVE=1` 同时出现。
