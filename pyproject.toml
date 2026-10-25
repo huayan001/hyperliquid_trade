@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hl-bot"
+version = "0.1.0"
+description = "Hyperliquid perpetual futures bot: v1.1 trend + mean-reversion with regime router"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "hyperliquid-python-sdk>=0.18.0",
+    "python-dotenv>=1.0.1",
+    "eth-account>=0.13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+hl-bot = "hl_bot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-q"

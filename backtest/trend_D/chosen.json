@@ -1,0 +1,1 @@
+{"chosen": "D-P", "eligible": ["B-P", "C-R", "D-R", "D-P", "E-R", "E-P"], "val_support": true, "tied": ["D-P"], "rule": "TRAIN 合格中 VAL Sharpe 最高（差≤0.01 取 VAL Calmar 高）", "time": "2026-09-29 16:11:40 CST"}

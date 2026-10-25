@@ -1,0 +1,116 @@
+# Hyperliquid 永续合约机器人 — 默认配置（v1.1）
+# 环境变量可覆盖同名项。密钥只能走环境变量，不要写进本文件。
+
+symbols = ["BTC", "ETH", "SOL", "HYPE"]
+network = "mainnet"          # mainnet | testnet
+dry_run = true
+paper_equity = 477.0
+poll_seconds = 900
+info_request_gap = 0.8   # /info 请求最小间隔秒
+symbol_gap_seconds = 3.0 # 标的之间间隔秒
+state_path = "state/paper_state.json"
+
+[regime]
+# 日线 ADX 超过该值才视为「趋势明确」（文档 20~25 的中间偏明确一侧）
+clear_trend_adx = 22.5
+# 日线 ADX 低于该值不算趋势，避免 20 附近中间地带误开趋势仓
+trend_adx_min = 20.0
+# 1h ADX 低于该值才考虑均值回归
+mr_adx_max = 20.0
+# 区间结构回看小时数（文档 8–12）
+range_lookback_hours = 12
+range_touch_frac = 0.20
+
+[trend]
+ema_fast = 20
+ema_slow = 50
+adx_period = 14
+adx_exit = 15.0
+btc_short_adx_min = 25.0
+donchian_period = 20
+atr_period = 14
+stop_atr = 2.0
+trail_step_atr = 1.0
+trail_offset_atr = 0.5
+# 出场：partial_atr = 方案 B（默认）；trail = 方案 A（阶梯移动止损 + 金字塔后抬到保本）。
+# B：开仓时冻结 4h ATR(14)。浮盈达该 ATR 的 1 倍（从当前均价量）平 50%，2 倍平剩余。
+# 初始结构止损全程不移动；Donchian 补仓和金字塔都可以做，但不会把止损抬向保本。
+# 已有仓没有 entry_atr 时：优先用开仓记下的 atr；否则用「当前止损距离 / stop_atr」反推；
+# 止损已经在保本一侧时，用当下 4h ATR。当前止损原样冻结，不放宽回 2×ATR。
+# 已经越过 1×/2× 的持仓，下一轮扫描会按 B 减仓或平仓。改回 trail 即恢复方案 A，不必回滚代码。
+exit_mode = "partial_atr"
+partial_atr = 1.0
+partial_atr_frac = 0.5
+partial2_atr = 2.0
+partial2_atr_frac = 1.0
+chase_body_atr = 1.5
+chase_symbols = ["BTC"]
+risk_pct = 0.01               # 单笔风险 1% 权益（实盘若设了 HL_RISK_PCT，仍以环境变量为准）
+btc_short_risk_mult = 0.7
+max_positions = 4             # 同时趋势仓上限；实盘单笔 1% × 4 仓正好用满 portfolio_risk_max
+portfolio_risk_max = 0.04
+daily_loss_delever = 0.05     # 达到后仓位减半，不停止开仓
+weekly_loss_delever = 0.10
+# 当日亏损达到该比例则停止新开仓和金字塔加仓（已有仓的止损/离场不动）。0 = 关闭
+daily_loss_halt = 0.03
+funding_annual_warn = 0.50
+# 高资金费时仓位下调系数（不做马丁，只缩小）
+funding_size_mult = 0.5
+# 趋势持仓默认不因资金费飙升自动离场（文档是「重新评估」）。需要时可打开，阈值独立且更高
+funding_exit_enabled = false
+funding_annual_exit = 2.0
+# 金字塔加仓（文档 2.4 可选进阶）：浮盈≥1×ATR 且趋势仍确认，加仓≤首仓 50%
+pyramid_enabled = true
+pyramid_min_atr = 1.0
+pyramid_max_frac = 0.5
+pyramid_skip_chase = true
+pyramid_be_buffer_atr = 0.05
+# 分层入场：日线趋势确认后先市价试探仓；4h Donchian 收盘突破再补剩余
+starter_enabled = true
+starter_frac = 0.35
+# 空列表 = 所有趋势标的；可写成 ["BTC", "ETH"] 只对部分品种启用
+starter_symbols = []
+# 止损出场后同标的同方向冷却：至少等 N 根已收盘 4h K 线（0 = 关闭）。6 根约 24h。
+# 冷却结束后，同向趋势新开仓仍要等止损之后的日线收盘重回 EMA20（多在上方、空在下方）。
+stop_cooldown_bars_4h = 6
+# BTC 日线 ADX 开关：off 不拉取、不改订单；shadow 只记录不拦截；enforce 低于阈值时跳过新趋势开仓
+# （不含加仓、止损、离场、均值回归）。当前先 shadow 观察 4–8 周。
+btc_regime_mode = "shadow"
+btc_regime_adx_min = 23.35
+btc_regime_adx_period = 14
+
+[mean_reversion]
+bb_period = 20
+bb_std = 2.0
+rsi_period = 14
+rsi_oversold = 30.0
+rsi_overbought = 70.0
+adx_period = 14
+adx_max = 20.0
+adx_kill = 25.0
+atr_period = 14
+stop_atr = 1.0
+time_stop_hours = 5.0        # 文档 4–6 小时
+partial_tp_frac = 0.5
+risk_pct = 0.02               # 单笔风险 2% 权益（与趋势一致）
+max_positions = 1
+max_trades_per_symbol_day = 3
+daily_loss_halt = 0.02
+leverage_cap = 10
+chase_body_atr = 1.5
+bandwidth_high_rank = 0.80   # 近 20 期高位区
+# 震荡/波段：逆向资金费年化 ≥ 本策略自己的阈值时可提前离场（不要复用 trend.funding_annual_warn）
+funding_exit_enabled = true
+funding_annual_exit = 0.50
+
+[risk]
+isolated = true
+min_notional_usd = 10.0
+target_leverage = 10
+liq_buffer_frac = 0.50          # 止损距 ≤ (1/lev)*该系数，避免强平抢先
+
+[risk.max_leverage]
+BTC = 10
+ETH = 10
+SOL = 10
+HYPE = 10
