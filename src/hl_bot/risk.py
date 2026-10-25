@@ -381,7 +381,7 @@ class RiskManager:
         position: Position,
         account: AccountState,
     ) -> RiskDecision:
-        """允许符合条件的趋势金字塔；拒绝浮亏摊平，且加仓后账户止损风险不得上升。"""
+        """允许符合条件的趋势金字塔；拒绝浮亏摊平。方案 A 还要求加仓后账户止损风险不上升。"""
         if self.trend_daily_halt_hit(account):
             return RiskDecision(False, self.trend_daily_halt_reason("停止金字塔加仓"))
         if not self.cfg.trend.pyramid_enabled:
@@ -397,7 +397,10 @@ class RiskManager:
 
         original = float(signal.extras.get("original_size") or position.original_size())
         add_size = float(signal.extras.get("add_size") or original * self.cfg.trend.pyramid_max_frac)
-        max_add = original * self.cfg.trend.pyramid_max_frac - (position.size - original)
+        # 用累计加仓比例，而不是「当前张数 − 首仓」。方案 B 先平掉一半后，净张数会小于首仓。
+        already_frac = float(position.extras.get("pyramid_added_frac") or 0.0)
+        already_added = original * already_frac
+        max_add = original * self.cfg.trend.pyramid_max_frac - already_added
         if add_size > max_add + 1e-9:
             return RiskDecision(False, f"加仓不得超过首仓 {self.cfg.trend.pyramid_max_frac:.0%}")
         if add_size * signal.entry_price < self.cfg.risk.min_notional_usd:
@@ -416,7 +419,9 @@ class RiskManager:
         others = account.open_risk_usd() - position.loss_risk_usd()
         old_total = account.open_risk_usd()
         new_total = others + new_risk
-        if new_total > old_total + 1e-6:
+        # 方案 A 靠保本把风险降下来，所以加仓后账户止损风险不得上升。
+        # 方案 B 冻结初始止损，加仓必然放大该仓风险；只保留组合上限。
+        if self.cfg.trend.exit_mode != "partial_atr" and new_total > old_total + 1e-6:
             return RiskDecision(False, "加仓后组合止损风险将扩大，拒绝金字塔")
         cap_pct = self.cfg.trend.portfolio_risk_max
         if new_total > account.equity * cap_pct + 1e-9:
@@ -489,6 +494,11 @@ class RiskManager:
         if decision.adjusted_stop is not None:
             extras["stop_tightened_for_liq"] = True
             extras["signal_stop_price"] = signal.stop_price
+        if signal.strategy is StrategyName.TREND:
+            atr_v = float(signal.extras.get("entry_atr") or signal.extras.get("atr") or 0.0)
+            if atr_v > 0:
+                extras["entry_atr"] = atr_v
+                extras.setdefault("entry_atr_source", "open_signal")
         frac = self._trend_open_frac(signal) if signal.strategy is StrategyName.TREND else 1.0
         if signal.extras.get("starter") and 0.0 < frac < 1.0 and sz.size > 0:
             extras["intended_full_size"] = sz.size / frac
@@ -521,7 +531,11 @@ def apply_fill(account: AccountState, position: Position) -> None:
 
 
 def apply_pyramid(account: AccountState, position: Position, add_size: float, add_price: float, new_stop: float) -> None:
-    """合并加仓段：加权均价，止损提到保本以上；首仓规模保持 _opened_size。"""
+    """合并加仓段：加权均价，止损设为调用方给出的价格；首仓规模保持 _opened_size。
+
+    方案 A 的调用方传入保本止损；方案 B 传入原结构止损。累计加仓量单独记账，
+    避免方案 B 先平掉一半之后用净张数把已加仓比例算没。
+    """
     if add_size <= 0:
         return
     old_size = position.size
@@ -531,9 +545,35 @@ def apply_pyramid(account: AccountState, position: Position, add_size: float, ad
     position.stop_price = new_stop
     opened = position.original_size()
     position.extras["_opened_size"] = opened
-    position.extras["pyramid_added_frac"] = max(0.0, (new_size - opened) / opened) if opened else 0.0
+    if "pyramid_added_size" in position.extras:
+        prev_added = float(position.extras.get("pyramid_added_size") or 0.0)
+    else:
+        prev_added = float(position.extras.get("pyramid_added_frac") or 0.0) * opened
+    added = prev_added + add_size
+    position.extras["pyramid_added_size"] = added
+    position.extras["pyramid_added_frac"] = (added / opened) if opened else 0.0
     position.remaining_frac = new_size / opened if opened else 1.0
     position.extras["pyramid_count"] = int(position.extras.get("pyramid_count") or 0) + 1
+
+
+def note_partial_atr_fill(position: Position, extras: dict, filled_size: float) -> None:
+    """方案 B 分批止盈成交后打标。成交量明显小于请求量时不打标，下一轮再减。"""
+    try:
+        level = int(extras.get("partial_atr_level") or 0)
+    except (TypeError, ValueError):
+        return
+    if level <= 0 or filled_size <= 0:
+        return
+    try:
+        requested = float(extras.get("partial_requested_size") or filled_size)
+    except (TypeError, ValueError):
+        requested = filled_size
+    if filled_size + 1e-9 < requested * 0.9:
+        return
+    if level >= 1:
+        position.extras["partial_atr_done"] = True
+    if level >= 2:
+        position.extras["partial2_atr_done"] = True
 
 
 def apply_tier_add(account: AccountState, position: Position, add_size: float, add_price: float, new_stop: float) -> None:

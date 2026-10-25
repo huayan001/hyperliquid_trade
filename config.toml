@@ -32,6 +32,17 @@ atr_period = 14
 stop_atr = 2.0
 trail_step_atr = 1.0
 trail_offset_atr = 0.5
+# 出场：partial_atr = 方案 B（默认）；trail = 方案 A（阶梯移动止损 + 金字塔后抬到保本）。
+# B：开仓时冻结 4h ATR(14)。浮盈达该 ATR 的 1 倍（从当前均价量）平 50%，2 倍平剩余。
+# 初始结构止损全程不移动；Donchian 补仓和金字塔都可以做，但不会把止损抬向保本。
+# 已有仓没有 entry_atr 时：优先用开仓记下的 atr；否则用「当前止损距离 / stop_atr」反推；
+# 止损已经在保本一侧时，用当下 4h ATR。当前止损原样冻结，不放宽回 2×ATR。
+# 已经越过 1×/2× 的持仓，下一轮扫描会按 B 减仓或平仓。改回 trail 即恢复方案 A，不必回滚代码。
+exit_mode = "partial_atr"
+partial_atr = 1.0
+partial_atr_frac = 0.5
+partial2_atr = 2.0
+partial2_atr_frac = 1.0
 chase_body_atr = 1.5
 chase_symbols = ["BTC"]
 risk_pct = 0.01               # 单笔风险 1% 权益（实盘若设了 HL_RISK_PCT，仍以环境变量为准）

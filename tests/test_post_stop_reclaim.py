@@ -275,11 +275,15 @@ def test_pyramid_unchanged_and_not_blocked_by_reclaim_gate(tmp_path, monkeypatch
     now_ms = max(below[-1].end_ts, h4[-1].end_ts) + 1
     runner = _runner(tmp_path, monkeypatch, below, h4, now_ms=now_ms, mid=111.0)
     runner._record_stop("ETH", Side.LONG, 90.0, -8.0, below[-1].ts + 60_000)
-    runner.account.positions.append(_pos(entry=100.0, stop=80.0))
-    # 金字塔不看日线是否在 EMA20 下，也不改成必须 4h 突破
+    # 111 已超过当下 4h ATR，够金字塔；入场 ATR 放宽到 40，避免方案 B 先在 1×ATR 减仓而跳过加仓。
+    runner.account.positions.append(
+        _pos(entry=100.0, stop=80.0, extras={"entry_atr": 40.0, "entry_atr_source": "open_signal"})
+    )
+    # 金字塔不看日线是否在 EMA20 下，也不改成必须 4h 突破。方案 B 不加保本。
     report = runner.scan_once()
     assert report.symbols[0].signal is not None
     assert report.symbols[0].signal.tag == "pyramid_add"
     assert report.symbols[0].intent is not None
     assert report.symbols[0].intent.action is IntentAction.ADD
+    assert report.symbols[0].intent.stop_price == 80.0
     assert not any("止损后再入场拒绝" in note for note in report.symbols[0].notes)

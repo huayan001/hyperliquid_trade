@@ -16,7 +16,8 @@ from hl_bot.models import (
     Side,
     StrategyName,
 )
-from hl_bot.risk import apply_close, apply_fill, apply_pyramid, apply_tier_add
+from hl_bot.risk import apply_close, apply_fill, apply_pyramid, apply_tier_add, note_partial_atr_fill
+from hl_bot.strategies.trend import record_entry_exit_reference
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class PaperBroker:
                 tag=str(intent.extras.get("tag") or ""),
                 extras=dict(intent.extras),
             )
+            record_entry_exit_reference(pos)
             apply_fill(self.account, pos)
             logger.info(
                 "PAPER 开仓 %s %s tier=%s tag=%s size=%.6g @ %.6g stop=%.6g lev=%sx isolated  %s",
@@ -98,7 +100,9 @@ class PaperBroker:
         pos = self.account.position_for(intent.symbol)
         if pos is None:
             return {"status": "paper", "action": "missing_position"}
-        pnl = apply_close(self.account, pos, intent.price, intent.size)
+        qty = min(intent.size, pos.size)
+        pnl = apply_close(self.account, pos, intent.price, qty)
+        note_partial_atr_fill(pos, intent.extras, qty)
         logger.info("PAPER 平仓 %s pnl=%.4f equity=%.2f", intent.symbol, pnl, self.account.equity)
         return {"status": "paper", "action": "close", "pnl": pnl}
 
