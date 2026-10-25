@@ -501,6 +501,7 @@ class BotRunner:
         self._exchange_positions = positions
         self._live_book_ok = True
         self._cancel_stacked_entries()
+        self._freeze_partial_atr_stops()
         self._drop_filled_resting(positions)
         self._align_open_sizes(positions)
         self._align_managed_leverage(positions)
@@ -594,8 +595,8 @@ class BotRunner:
         - 均价以交易所 entryPx 为准；
         - 首仓：止损按真实成交价平移（保持信号止损距离）；
         - Donchian 补仓：更新分层计数（tier_add_done 等），共用止损；
-        - 金字塔：更新加仓计数，并按真实均价重算保本止损；
-        - 按交易所实际止损核算风险，超过单笔风险上限（2% 权益）则收紧；
+        - 金字塔：方案 A 按真实均价重算保本止损；方案 B 保持已冻结的结构止损，不用挂单上的保本价；
+        - 按交易所实际止损核算风险，超过单笔风险上限则收紧。方案 B 已冻结的结构止损不再为了贴风险比例而收紧；
         随后同一轮 _ensure_managed_stops 会把 reduce-only 止损替换为覆盖整仓。
         """
         tol = max(1e-8, rec.position_size_at_submit * 0.02, 10 ** -4)
@@ -633,6 +634,8 @@ class BotRunner:
             )
             pos.extras["_opened_size"] = ex.size
             apply_fill(self.account, pos)
+            self._cap_position_risk(pos)
+            self.trend.ensure_partial_atr_snapshot(pos)
             logger.info(
                 "%s resting %s 已成交，纳入本地仓位 size=%.6g 均价=%.6g（挂单价 %.6g）止损=%.6g（原 %.6g）",
                 rec.symbol,
@@ -640,10 +643,9 @@ class BotRunner:
                 ex.size,
                 entry,
                 rec.price,
-                stop,
+                pos.stop_price,
                 rec.stop_price,
             )
-            self._cap_position_risk(pos)
             return
         if local.side is not ex.side:
             return
@@ -665,21 +667,25 @@ class BotRunner:
             apply_tier_add(self.account, local, add_size, add_px, local.stop_price)
             kind = "Donchian 补仓"
         elif is_pyramid:
-            current = local.stop_price
-            if rec.stop_price and rec.stop_price > 0:
-                current = max(current, rec.stop_price) if local.side is Side.LONG else min(current, rec.stop_price)
-            atr_v = float(rec.extras.get("atr") or 0.0)
-            new_stop = self.trend.pyramid_breakeven_stop(real_entry, atr_v, local.side, current)
-            mark = self._mark_px(local.symbol)
-            if self._stop_wrong_side(local.side, new_stop, mark):
-                logger.warning(
-                    "%s 金字塔成交后保本止损 %.6g 已在现价 %.6g 错误一侧，暂保留原止损 %.6g",
-                    local.symbol,
-                    new_stop,
-                    mark,
-                    local.stop_price,
-                )
+            if self.trend.partial_atr_enabled():
+                # 挂单上可能还带着方案 A 的保本价。方案 B 成交后不采用它。
                 new_stop = local.stop_price
+            else:
+                current = local.stop_price
+                if rec.stop_price and rec.stop_price > 0:
+                    current = max(current, rec.stop_price) if local.side is Side.LONG else min(current, rec.stop_price)
+                atr_v = float(rec.extras.get("atr") or 0.0)
+                new_stop = self.trend.pyramid_breakeven_stop(real_entry, atr_v, local.side, current)
+                mark = self._mark_px(local.symbol)
+                if self._stop_wrong_side(local.side, new_stop, mark):
+                    logger.warning(
+                        "%s 金字塔成交后保本止损 %.6g 已在现价 %.6g 错误一侧，暂保留原止损 %.6g",
+                        local.symbol,
+                        new_stop,
+                        mark,
+                        local.stop_price,
+                    )
+                    new_stop = local.stop_price
             apply_pyramid(self.account, local, add_size, add_px, new_stop)
             kind = "金字塔加仓"
         else:
@@ -729,8 +735,21 @@ class BotRunner:
             pct *= float(self.cfg.trend.btc_short_risk_mult)
         return pct
 
+    def _freeze_partial_atr_stops(self) -> None:
+        """方案 B：对账改止损之前，先把已有趋势仓的入场 ATR 和当前止损冻结下来。"""
+        if not self.trend.partial_atr_enabled():
+            return
+        for pos in self.account.open_positions():
+            self.trend.ensure_partial_atr_snapshot(pos)
+
     def _cap_position_risk(self, pos: Position) -> None:
         """按交易所实际止损（没有则本地止损）核算该仓风险；超过 risk_pct×权益则收紧本地止损。"""
+        if (
+            pos.strategy is StrategyName.TREND
+            and self.trend.partial_atr_enabled()
+            and pos.extras.get("partial_atr_stop_frozen")
+        ):
+            return
         equity = float(self.account.equity or 0.0)
         if equity <= 0 or not self._equity_ok or pos.size <= 0 or pos.entry_price <= 0:
             return
@@ -1038,13 +1057,22 @@ class BotRunner:
             if not local.stop_price or local.stop_price <= 0 or local.entry_price <= 0:
                 continue
             ex = self._exchange_position(positions, local.symbol)
-            adj, tightened = clamp_stop_for_leverage(
-                side=local.side,
-                entry=local.entry_price,
-                stop=local.stop_price,
-                leverage=target,
-                buffer_frac=buffer_frac,
+            frozen = (
+                local.strategy is StrategyName.TREND
+                and self.trend.partial_atr_enabled()
+                and bool(local.extras.get("partial_atr_stop_frozen"))
             )
+            if frozen:
+                # 均价变了再按 1/杠杆 公式收紧，会在加仓后把止损朝保本推。只认交易所真实强平价。
+                adj, tightened = float(local.stop_price), False
+            else:
+                adj, tightened = clamp_stop_for_leverage(
+                    side=local.side,
+                    entry=local.entry_price,
+                    stop=local.stop_price,
+                    leverage=target,
+                    buffer_frac=buffer_frac,
+                )
             # 若交易所有明确强平价，再与之交叉校验：多头止损必须 > 强平价
             if ex is not None and ex.liquidation_px and ex.liquidation_px > 0:
                 liq = float(ex.liquidation_px)

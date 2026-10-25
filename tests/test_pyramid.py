@@ -75,6 +75,7 @@ def test_pyramid_skipped_when_profit_below_one_atr() -> None:
 def test_pyramid_adds_at_most_half_when_profit_reaches_atr() -> None:
     strat = TrendStrategy()
     pos = _pos(size=2.0)
+    old_stop = pos.stop_price
     old_risk = pos.loss_risk_usd()
     snap = market("ETH", h4=_wide_h4(), mid=111.0)
     sig = strat.generate_pyramid(pos, snap, _confirmed())
@@ -82,8 +83,10 @@ def test_pyramid_adds_at_most_half_when_profit_reaches_atr() -> None:
     assert sig.tag == "pyramid_add"
     assert sig.extras["add_size"] <= 2.0 * 0.5 + 1e-9
     assert sig.extras["add_size"] == 1.0
-    # 加权均价 (2*100+1*111)/3 = 103.666，止损应在其上方
-    assert sig.stop_price > sig.extras["avg_entry"]
+    # 默认方案 B：止损停在开仓结构止损，不抬到均价之上
+    assert sig.stop_price == old_stop
+    assert "不加保本" in sig.reason
+    assert "移至保本" not in sig.reason
     rm = RiskManager(BotConfig())
     verdict = rm.evaluate_pyramid(sig, pos, _acct(pos))
     assert verdict.allowed
@@ -92,7 +95,8 @@ def test_pyramid_adds_at_most_half_when_profit_reaches_atr() -> None:
     apply_pyramid(_acct(pos), pos, verdict.size.size, sig.entry_price, sig.stop_price)
     assert pos.size == 3.0
     assert pos.pyramid_added_frac() <= 0.5 + 1e-9
-    assert pos.loss_risk_usd() <= old_risk
+    assert pos.stop_price == old_stop
+    assert pos.loss_risk_usd() > old_risk
 
 
 def test_pyramid_skips_chase_entry() -> None:

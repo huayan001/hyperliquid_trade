@@ -20,6 +20,9 @@ TESTNET_WS_URL = "wss://api.hyperliquid-testnet.xyz/ws"
 
 DEFAULT_SYMBOLS = ("BTC", "ETH", "SOL", "HYPE")
 BTC_REGIME_MODES = ("off", "shadow", "enforce")
+# partial_atr = 方案 B：1×入场 ATR 平一半，2×平剩余，初始止损冻结。
+# trail = 方案 A：阶梯移动止损，金字塔后把止损抬到保本。
+EXIT_MODES = ("partial_atr", "trail")
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -71,6 +74,14 @@ class TrendConfig:
     stop_atr: float = 2.0
     trail_step_atr: float = 1.0
     trail_offset_atr: float = 0.5
+    # partial_atr（默认，方案 B）：浮盈达开仓时冻结的 4h ATR 的 partial_atr 倍平 partial_atr_frac，
+    # partial2_atr 倍平剩余；初始结构止损全程不移动，金字塔/Donchian 加仓也不抬到保本。
+    # trail（方案 A）：v0 阶梯移动止损，金字塔加仓后止损抬到保本以上。
+    exit_mode: str = "partial_atr"
+    partial_atr: float = 1.0
+    partial_atr_frac: float = 0.5
+    partial2_atr: float = 2.0
+    partial2_atr_frac: float = 1.0
     chase_body_atr: float = 1.5
     chase_symbols: tuple[str, ...] = ("BTC",)
     risk_pct: float = 0.02
@@ -177,6 +188,29 @@ class BotConfig:
             raise RuntimeError("实盘需要环境变量 HL_PRIVATE_KEY。")
 
 
+def _parse_exit_mode(value: Any) -> str:
+    if value is None or value == "":
+        return "partial_atr"
+    mode = str(value).strip().lower()
+    if mode not in EXIT_MODES:
+        raise ValueError(f"trend.exit_mode 必须是 partial_atr 或 trail，收到 {value!r}")
+    return mode
+
+
+def _parse_positive_float(value: Any, default: float, name: str) -> float:
+    number = _as_float(value, default)
+    if math.isnan(number) or math.isinf(number) or number <= 0:
+        raise ValueError(f"{name} 必须是正数，收到 {value!r}")
+    return number
+
+
+def _parse_unit_fraction(value: Any, default: float, name: str) -> float:
+    number = _as_float(value, default)
+    if math.isnan(number) or math.isinf(number) or number <= 0 or number > 1:
+        raise ValueError(f"{name} 必须在 (0, 1] 内，收到 {value!r}")
+    return number
+
+
 def _parse_btc_regime_mode(value: Any) -> str:
     if value is None or value == "":
         return "off"
@@ -230,6 +264,13 @@ def load_config(
     mr_raw = _section(raw, "mean_reversion")
     risk_raw = _section(raw, "risk")
     max_lev = risk_raw.get("max_leverage") or {}
+    exit_mode = _parse_exit_mode(trend_raw.get("exit_mode"))
+    partial_atr = _parse_positive_float(trend_raw.get("partial_atr"), 1.0, "trend.partial_atr")
+    partial2_atr = _parse_positive_float(trend_raw.get("partial2_atr"), 2.0, "trend.partial2_atr")
+    if partial2_atr <= partial_atr:
+        raise ValueError(
+            f"trend.partial2_atr 必须大于 trend.partial_atr，收到 {partial2_atr} <= {partial_atr}"
+        )
 
     cfg = BotConfig(
         symbols=_as_list(os.getenv("HL_SYMBOLS", raw.get("symbols")), DEFAULT_SYMBOLS),
@@ -259,6 +300,15 @@ def load_config(
             stop_atr=_as_float(trend_raw.get("stop_atr"), 2.0),
             trail_step_atr=_as_float(trend_raw.get("trail_step_atr"), 1.0),
             trail_offset_atr=_as_float(trend_raw.get("trail_offset_atr"), 0.5),
+            exit_mode=exit_mode,
+            partial_atr=partial_atr,
+            partial_atr_frac=_parse_unit_fraction(
+                trend_raw.get("partial_atr_frac"), 0.5, "trend.partial_atr_frac"
+            ),
+            partial2_atr=partial2_atr,
+            partial2_atr_frac=_parse_unit_fraction(
+                trend_raw.get("partial2_atr_frac"), 1.0, "trend.partial2_atr_frac"
+            ),
             chase_body_atr=_as_float(trend_raw.get("chase_body_atr"), 1.5),
             chase_symbols=_as_list(trend_raw.get("chase_symbols"), ("BTC",)),
             risk_pct=_as_float(trend_raw.get("risk_pct"), 0.02),

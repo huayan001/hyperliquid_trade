@@ -150,6 +150,7 @@ CTX = {"SOL": {"sz_decimals": 2, "mark_px": 106.0}}
 def test_pyramid_resting_fill_writes_back_entry_counters_and_breakeven_stop(tmp_path) -> None:
     ex = Exch(order_results=[_ok_resting(880)])
     runner = _runner(tmp_path, ex)
+    runner.cfg.trend.exit_mode = "trail"
     runner.account.positions.append(_pos())
     runner.account.resting_entries.append(_rec())
     runner.client.fetch_open_orders = lambda: [_stop_row("SOL", 9, 1.0, 97.0)]  # type: ignore[method-assign]
@@ -178,6 +179,7 @@ def test_pyramid_resting_fill_writes_back_entry_counters_and_breakeven_stop(tmp_
 def test_pyramid_breakeven_not_placed_on_wrong_side_of_mark(tmp_path) -> None:
     ex = Exch(order_results=[_ok_resting(881)])
     runner = _runner(tmp_path, ex)
+    runner.cfg.trend.exit_mode = "trail"
     runner.account.positions.append(_pos())
     runner.account.resting_entries.append(_rec())
     runner.client.fetch_open_orders = lambda: [_stop_row("SOL", 9, 1.0, 97.0)]  # type: ignore[method-assign]

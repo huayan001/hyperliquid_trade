@@ -47,6 +47,7 @@ def make_close_intent(
     *,
     size: float | None = None,
     kind_market: bool = True,
+    extras: dict | None = None,
 ) -> OrderIntent:
     from hl_bot.models import OrderKind, StrategyName
 
@@ -66,4 +67,5 @@ def make_close_intent(
         reduce_only=True,
         reason=reason,
         notional_usd=qty * price,
+        extras=dict(extras or {}),
     )
