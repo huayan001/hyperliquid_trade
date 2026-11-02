@@ -106,6 +106,8 @@ def _runner(
     cfg.trend.btc_regime_mode = mode
     cfg.trend.btc_regime_adx_min = 23.35
     cfg.trend.btc_regime_adx_period = 14
+    # 本组只测 ADX 强度闸。日线偏空闸默认 enforce，这里关掉，避免多拉一次或改写拦截结果。
+    cfg.trend.btc_bearish_long_mode = "off"
     runner = BotRunner(cfg)
     runner.client.fetch_asset_contexts = lambda: _contexts(symbols)  # type: ignore[method-assign]
     runner.client.fetch_mids = lambda: {symbol: 100.0 for symbol in symbols}  # type: ignore[method-assign]

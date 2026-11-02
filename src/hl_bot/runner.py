@@ -10,6 +10,7 @@ from pathlib import Path
 from hl_bot.alerts import AlertSink
 from hl_bot.btc_regime import BtcRegimeGate, shadow_log_path
 from hl_bot.config import BotConfig
+from hl_bot.portfolio import net_exposure_blocks_long
 from hl_bot.exchange.client import (
     AccountSnapshot,
     ExchangePosition,
@@ -139,7 +140,12 @@ class BotRunner:
         self.risk = RiskManager(cfg)
         self.trend = TrendStrategy(cfg.trend)
         self.mr = MeanReversionStrategy(cfg.mean_reversion)
-        self.btc_regime = BtcRegimeGate(cfg.trend, self.client, shadow_log_path(cfg.state_path))
+        self.btc_regime = BtcRegimeGate(
+            cfg.trend,
+            self.client,
+            shadow_log_path(cfg.state_path),
+            bearish_adx_min=cfg.regime.clear_trend_adx,
+        )
         day_key, week_key, _ = _utc_keys()
         self.broker = PaperBroker.load(cfg.state_path, cfg.paper_equity, day_key, week_key)
         self._open_orders: list[dict] | None = None
@@ -281,6 +287,7 @@ class BotRunner:
 
             cooldown = None
             reclaim_block = None
+            direction_block = None
             if signal is not None and existing is None and not closing:
                 cooldown = self.stop_cooldown_reason(symbol, signal.side, now_ms)
                 if cooldown:
@@ -292,7 +299,23 @@ class BotRunner:
                     if reclaim_block:
                         notes.append(f"止损后再入场拒绝：{reclaim_block}")
                         logger.info("%s 新开仓被止损后再入场过滤拒绝：%s", symbol, reclaim_block)
-            if signal is not None and existing is None and not closing and not cooldown and not reclaim_block:
+                if not cooldown and not reclaim_block and signal.side is Side.LONG:
+                    # 新标的的做多：净空硬拦截；BTC 日线明确空头按 btc_bearish_long_mode。
+                    # 已有多仓的止损、减仓、补仓、金字塔走上面的 existing 分支，不进这里。
+                    direction_block = self.portfolio_direction_reason(signal.side)
+                    if direction_block:
+                        notes.append(f"组合方向拒绝：{direction_block}")
+                        logger.info("%s 新开多被组合方向过滤拒绝：%s", symbol, direction_block)
+                    elif self._btc_bearish_long_block(signal, now_ms, notes):
+                        direction_block = "btc_bearish"
+            if (
+                signal is not None
+                and existing is None
+                and not closing
+                and not cooldown
+                and not reclaim_block
+                and not direction_block
+            ):
                 against = funding_against(signal.side, market.funding.hourly_rate)
                 huge_funding = (
                     against
@@ -922,6 +945,25 @@ class BotRunner:
             "pnl": float(pnl),
             "label": label,
         }
+
+    def portfolio_direction_reason(self, side: Side) -> str | None:
+        """净空敞口时拒绝新开多。做空、以及开关关闭时返回 None。"""
+        if side is not Side.LONG:
+            return None
+        return net_exposure_blocks_long(
+            self.account.open_positions(),
+            enabled=bool(self.cfg.trend.block_new_longs_when_net_short),
+        )
+
+    def _btc_bearish_long_block(self, signal: Signal, now_ms: int, notes: list[str]) -> bool:
+        """BTC 日线明确空头时按 btc_bearish_long_mode 处理新多。off 不拉 K 线。"""
+        if self.btc_regime.bearish_mode == "off":
+            return False
+        try:
+            return self.btc_regime.blocks_bearish_long(signal.symbol, signal.side.value, now_ms, notes)
+        except Exception as exc:
+            logger.warning("BTC 日线偏空判断异常，fail-open 不拦截 %s: %s", signal.symbol, exc)
+            return False
 
     def post_stop_reclaim_reason(
         self,

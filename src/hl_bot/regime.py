@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from hl_bot.config import RegimeConfig
 from hl_bot.indicators import adx, ema, last_value
-from hl_bot.models import Candle, RangeStructure, Regime, RegimeDecision
+from hl_bot.models import Candle, RangeStructure, Regime, RegimeDecision, Side
 
 
 def detect_range_structure(
@@ -55,6 +55,26 @@ def detect_range_structure(
     return RangeStructure(is_range, high, low, touched_high, touched_low, new_extreme, reason)
 
 
+def daily_clear_trend_side(
+    ema_fast: float,
+    ema_slow: float,
+    daily_adx: float,
+    *,
+    clear_trend_adx: float,
+) -> Side | None:
+    """日线趋势明确时的方向。与下面「趋势明确」分支同一条件，不含 1h 冲突覆盖。
+
+    EMA20>EMA50 且 ADX≥clear_trend_adx → 多；反过来 → 空；否则 None（含中间地带）。
+    """
+    if daily_adx < clear_trend_adx:
+        return None
+    if ema_fast > ema_slow:
+        return Side.LONG
+    if ema_fast < ema_slow:
+        return Side.SHORT
+    return None
+
+
 def decide_from_metrics(
     *,
     ema_fast: float,
@@ -74,7 +94,9 @@ def decide_from_metrics(
     bearish = ema_fast < ema_slow
     ema_aligned = bullish or bearish
     daily_trend_ok = ema_aligned and daily_adx >= cfg.trend_adx_min
-    daily_trend_clear = ema_aligned and daily_adx >= cfg.clear_trend_adx
+    clear_side = daily_clear_trend_side(
+        ema_fast, ema_slow, daily_adx, clear_trend_adx=cfg.clear_trend_adx
+    )
     hourly_range = hourly_adx < cfg.mr_adx_max and rng.is_range
 
     if daily_trend_ok and hourly_range:
@@ -89,10 +111,10 @@ def decide_from_metrics(
             True,
         )
 
-    if daily_trend_clear:
-        regime = Regime.TREND_LONG if bullish else Regime.TREND_SHORT
-        direction = "多头" if bullish else "空头"
-        cmp = ">" if bullish else "<"
+    if clear_side is not None:
+        regime = Regime.TREND_LONG if clear_side is Side.LONG else Regime.TREND_SHORT
+        direction = "多头" if clear_side is Side.LONG else "空头"
+        cmp = ">" if clear_side is Side.LONG else "<"
         return RegimeDecision(
             regime,
             ema_fast,
@@ -104,7 +126,7 @@ def decide_from_metrics(
             False,
         )
 
-    if daily_trend_ok and not daily_trend_clear:
+    if daily_trend_ok and clear_side is None:
         return RegimeDecision(
             Regime.WATCH,
             ema_fast,

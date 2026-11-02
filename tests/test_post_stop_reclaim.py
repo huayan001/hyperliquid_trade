@@ -45,6 +45,8 @@ def _runner(tmp_path, monkeypatch, daily, h4, *, now_ms: int, mid: float, regime
     cfg.state_path = str(tmp_path / "paper_state.json")
     cfg.trend.btc_regime_mode = "off"
     cfg.trend.stop_cooldown_bars_4h = 0
+    # 本组只看止损后再入场。偏空闸默认 enforce，关掉以免扫描去拉 BTC 日线。
+    cfg.trend.btc_bearish_long_mode = "off"
     runner = BotRunner(cfg)
     runner.client.fetch_asset_contexts = lambda: {  # type: ignore[method-assign]
         "ETH": {"funding": 0.0, "mark_px": mid, "mid_px": mid, "max_leverage": 20, "sz_decimals": 4}

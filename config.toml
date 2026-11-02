@@ -78,6 +78,14 @@ stop_cooldown_bars_4h = 6
 btc_regime_mode = "shadow"
 btc_regime_adx_min = 23.35
 btc_regime_adx_period = 14
+# 组合方向：账户净名义为负（空头开仓名义 > 多头开仓名义）时禁止新开多。
+# 只管新标的（趋势 starter / Donchian 首仓 / 均值回归做多）。
+# 已有多仓的止损、减仓、Donchian 补仓、金字塔照常。false = 关闭。
+block_new_longs_when_net_short = true
+# BTC 日线明确空头时禁止新开多。off 关闭；shadow 只记日志；enforce 硬拦截。
+# 明确空头与环境路由一致：EMA20<EMA50 且日线 ADX≥regime.clear_trend_adx（默认 22.5），
+# 不看 1h 是否冲突。与上面的 btc_regime_mode（ADX 强度、仍是 shadow、多空都看）独立。读数失败放行。
+btc_bearish_long_mode = "enforce"
 
 [mean_reversion]
 bb_period = 20

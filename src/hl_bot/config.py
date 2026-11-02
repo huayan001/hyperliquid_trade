@@ -112,6 +112,11 @@ class TrendConfig:
     btc_regime_mode: str = "off"
     btc_regime_adx_min: float = 23.35
     btc_regime_adx_period: int = 14
+    # 净名义为负（空头开仓名义 > 多头）时禁止新开多。已有多仓的止损/减仓/补仓/金字塔不拦截。
+    block_new_longs_when_net_short: bool = True
+    # BTC 日线明确空头时禁止新开多。off 关闭；shadow 只记日志；enforce 硬拦截。
+    # 与 btc_regime_mode（ADX 强度，多空新趋势仓都看）独立。阈值用 regime.clear_trend_adx。
+    btc_bearish_long_mode: str = "enforce"
 
 
 @dataclass(slots=True)
@@ -211,15 +216,17 @@ def _parse_unit_fraction(value: Any, default: float, name: str) -> float:
     return number
 
 
-def _parse_btc_regime_mode(value: Any) -> str:
+def _parse_gate_mode(value: Any, *, name: str, default: str) -> str:
     if value is None or value == "":
-        return "off"
+        return default
     mode = str(value).strip().lower()
     if mode not in BTC_REGIME_MODES:
-        raise ValueError(
-            f"trend.btc_regime_mode 必须是 off、shadow 或 enforce，收到 {value!r}"
-        )
+        raise ValueError(f"{name} 必须是 off、shadow 或 enforce，收到 {value!r}")
     return mode
+
+
+def _parse_btc_regime_mode(value: Any) -> str:
+    return _parse_gate_mode(value, name="trend.btc_regime_mode", default="off")
 
 
 def _parse_btc_regime_adx_min(value: Any) -> float:
@@ -334,6 +341,14 @@ def load_config(
             btc_regime_mode=_parse_btc_regime_mode(trend_raw.get("btc_regime_mode")),
             btc_regime_adx_min=_parse_btc_regime_adx_min(trend_raw.get("btc_regime_adx_min")),
             btc_regime_adx_period=_parse_btc_regime_period(trend_raw.get("btc_regime_adx_period")),
+            block_new_longs_when_net_short=_as_bool(
+                trend_raw.get("block_new_longs_when_net_short"), True
+            ),
+            btc_bearish_long_mode=_parse_gate_mode(
+                trend_raw.get("btc_bearish_long_mode"),
+                name="trend.btc_bearish_long_mode",
+                default="enforce",
+            ),
         ),
         mean_reversion=MeanReversionConfig(
             bb_period=_as_int(mr_raw.get("bb_period"), 20),
