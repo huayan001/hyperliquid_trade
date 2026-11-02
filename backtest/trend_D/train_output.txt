@@ -1,0 +1,13 @@
+[2026-09-29 16:10:35 CST] TRAIN 阈值 {"A": 25.159459394178064, "B": 51.386447167036565, "C": 0.13567625986242085, "D": 23.354257318089893, "E": -2.6826837368077645}  (B1 TRAIN 开仓 192 笔)
+B0     ret=+112.3% mdd= 51.8% sharpe=1.14 calmar=1.33 n=189 win=19.0% pf=1.59 paused=0 reduced=0
+B1     ret=+62.0% mdd= 31.9% sharpe=1.08 calmar=1.24 n=192 win=18.2% pf=1.84 paused=0 reduced=0
+A-R    ret=+24.7% mdd= 28.1% sharpe=0.68 calmar=0.59 n=192 win=18.2% pf=1.50 paused=0 reduced=749 eligible=False
+A-P    ret=+12.3% mdd= 33.1% sharpe=0.42 calmar=0.25 n=160 win=21.2% pf=1.29 paused=2824 reduced=0 eligible=False
+B-R    ret=+23.2% mdd= 29.6% sharpe=0.65 calmar=0.53 n=192 win=18.2% pf=1.45 paused=0 reduced=2216 eligible=False
+B-P    ret=+56.1% mdd= 29.3% sharpe=1.06 calmar=1.23 n=158 win=19.0% pf=1.87 paused=4992 reduced=0 eligible=True
+C-R    ret=+63.8% mdd= 28.2% sharpe=1.13 calmar=1.45 n=192 win=18.2% pf=2.00 paused=0 reduced=2022 eligible=True
+C-P    ret=+1.3% mdd= 31.7% sharpe=0.17 calmar=0.03 n=188 win=20.7% pf=1.03 paused=3023 reduced=0 eligible=False
+D-R    ret=+60.6% mdd= 28.7% sharpe=1.10 calmar=1.36 n=192 win=18.2% pf=1.98 paused=0 reduced=278 eligible=True
+D-P    ret=+77.4% mdd= 25.4% sharpe=1.25 calmar=1.92 n=139 win=19.4% pf=2.32 paused=3275 reduced=0 eligible=True
+E-R    ret=+68.9% mdd= 27.6% sharpe=1.20 calmar=1.59 n=192 win=18.2% pf=2.12 paused=0 reduced=1065 eligible=True
+E-P    ret=+71.7% mdd= 25.6% sharpe=1.21 calmar=1.78 n=158 win=16.5% pf=2.20 paused=3386 reduced=0 eligible=True

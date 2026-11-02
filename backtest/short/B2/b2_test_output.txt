@@ -1,0 +1,13 @@
+### b2.py test (ONE-SHOT) 2026-09-29 15:08:55 CST
+RS2-E1  [long/test] signals=207 trades=89 ret=+2.33% mdd=5.1% pf=1.18 win=52% avgR=+0.054 avgWin=$3.25 avgLoss=$-2.94 fees=$9.3 (6% of gross) fund=$+0.91 exits={'time': 74, 'stop': 15} per-sym pnl={'BTC': -11.4, 'ETH': -2.2, 'SOL': 23.5, 'HYPE': 13.4}
+RS2-E1  [long/train] signals=196 trades=69 ret=+8.89% mdd=1.9% pf=2.14 win=59% avgR=+0.250 avgWin=$4.07 avgLoss=$-2.78 fees=$6.1 (4% of gross) fund=$+2.09 exits={'time': 60, 'stop': 9} per-sym pnl={'BTC': 33.6, 'ETH': 18.3, 'SOL': 37.1, 'HYPE': 0}
+RS2-E1  [long/full] signals=559 trades=223 ret=+22.44% mdd=5.1% pf=1.72 win=56% avgR=+0.185 avgWin=$4.27 avgLoss=$-3.16 fees=$24.7 (5% of gross) fund=$+4.22 exits={'time': 190, 'stop': 33} per-sym pnl={'BTC': 37.4, 'ETH': 38.6, 'SOL': 92.0, 'HYPE': 56.4}
+RS2-E1  [hl/hl] signals=167 trades=71 ret=-3.66% mdd=6.5% pf=0.69 win=48% avgR=-0.103 avgWin=$2.44 avgLoss=$-3.23 fees=$7.7 (9% of gross) fund=$+0.15 exits={'time': 54, 'stop': 17} per-sym pnl={'BTC': -12.0, 'ETH': -30.5, 'SOL': 2.4, 'HYPE': 3.4}
+event-level train {'n': 221, 'mean_gross_bp': 145.4, 'mean_net_bp': 135.1, 'hit_net': 0.62}
+event-level val {'n': 156, 'mean_gross_bp': 83.3, 'mean_net_bp': 74.2, 'hit_net': 0.59}
+event-level test {'n': 207, 'mean_gross_bp': -12.0, 'mean_net_bp': -20.5, 'hit_net': 0.449}
+monthly corr with L0 (full period): -0.017
+
+real	0m10.750s
+user	0m10.525s
+sys	0m0.223s

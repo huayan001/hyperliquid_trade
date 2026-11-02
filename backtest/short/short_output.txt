@@ -1,0 +1,41 @@
+### short.py 2026-09-29 12:59:53 CST
+[long4] A: ret=-42.9% mdd=44.5% n=444 win=48% pf=0.68 avgR=-0.164 fees=$80 (9% of gross) fund=$-4.7 exp=9% | IS n=254 pf=0.72 ret=-23.2% | OOS n=190 pf=0.61 ret=-25.7% | corrL0=+0.40
+      exits {'target': 220, 'stop': 219, 'mid_cross': 5} | per-sym pnl {'BTC': -138.0, 'ETH': -91.9, 'SOL': -114.3, 'HYPE': -84.8} | solo ret {'BTC': '-15.6%', 'ETH': '-10.6%', 'SOL': '-13.9%', 'HYPE': '-11.9%'}
+      periods {'2023Q4-2024Q1': '-4.3%/n58/pf0.82', '2024Q2-Q4': '-14.8%/n72/pf0.50', '2025H1': '-9.4%/n62/pf0.62', '2025H2': '-1.1%/n98/pf0.97', '2026': '-21.8%/n154/pf0.59'}
+[long4] B: ret=-23.5% mdd=23.5% n=158 win=29% pf=0.70 avgR=-0.218 fees=$34 (6% of gross) fund=$-2.3 exp=9% | IS n=86 pf=0.72 ret=-12.3% | OOS n=72 pf=0.68 ret=-12.7% | corrL0=+0.12
+      exits {'stop': 112, 'time': 5, 'target': 41} | per-sym pnl {'BTC': -43.1, 'ETH': -84.1, 'SOL': -57.3, 'HYPE': -50.6} | solo ret {'BTC': '-4.0%', 'ETH': '-8.9%', 'SOL': '-7.0%', 'HYPE': '-5.8%'}
+      periods {'2023Q4-2024Q1': '-6.7%/n10/pf0.00', '2024Q2-Q4': '-3.0%/n35/pf0.84', '2025H1': '-6.0%/n25/pf0.59', '2025H2': '+6.2%/n29/pf1.48', '2026': '-15.3%/n59/pf0.54'}
+[long4] C: ret=-52.0% mdd=61.6% n=2636 win=54% pf=0.88 avgR=-0.053 fees=$338 (8% of gross) fund=$13.5 exp=31% | IS n=1581 pf=0.89 ret=-34.6% | OOS n=1055 pf=0.87 ret=-26.7% | corrL0=+0.46
+      exits {'stop': 1046, 'target': 1293, 'time': 296, 'end': 1} | per-sym pnl {'BTC': -335.8, 'ETH': -224.7, 'SOL': -38.9, 'HYPE': 79.2} | solo ret {'BTC': '-34.4%', 'ETH': '-27.5%', 'SOL': '-9.5%', 'HYPE': '+12.8%'}
+      periods {'2023Q4-2024Q1': '+9.8%/n361/pf1.13', '2024Q2-Q4': '-27.8%/n644/pf0.78', '2025H1': '-12.2%/n435/pf0.86', '2025H2': '-11.4%/n526/pf0.89', '2026': '-22.2%/n670/pf0.84'}
+[long3] A: ret=-32.2% mdd=33.3% n=306 win=48% pf=0.68 avgR=-0.166 fees=$49 (7% of gross) fund=$-4.6 exp=7% | IS n=155 pf=0.72 ret=-14.9% | OOS n=151 pf=0.63 ret=-20.3% | corrL0=+0.28
+      exits {'stop': 152, 'target': 150, 'mid_cross': 4} | per-sym pnl {'ETH': -98.1, 'SOL': -126.0, 'HYPE': -97.9} | solo ret {'ETH': '-10.6%', 'SOL': '-13.9%', 'HYPE': '-11.9%'}
+      periods {'2023Q4-2024Q1': '-3.5%/n47/pf0.82', '2024Q2-Q4': '-7.8%/n38/pf0.48', '2025H1': '-5.2%/n31/pf0.59', '2025H2': '-2.2%/n65/pf0.90', '2026': '-17.8%/n125/pf0.61'}
+[long3] B: ret=-20.2% mdd=22.2% n=114 win=28% pf=0.66 avgR=-0.257 fees=$22 (6% of gross) fund=$-1.8 exp=7% | IS n=55 pf=0.72 ret=-8.1% | OOS n=59 pf=0.61 ret=-13.2% | corrL0=+0.19
+      exits {'stop': 82, 'time': 5, 'target': 27} | per-sym pnl {'ETH': -88.4, 'SOL': -61.3, 'HYPE': -52.4} | solo ret {'ETH': '-8.9%', 'SOL': '-7.0%', 'HYPE': '-5.8%'}
+      periods {'2023Q4-2024Q1': '-3.0%/n5/pf0.01', '2024Q2-Q4': '-1.4%/n25/pf0.89', '2025H1': '-2.9%/n15/pf0.66', '2025H2': '+0.8%/n19/pf1.09', '2026': '-14.8%/n50/pf0.49'}
+[long3] C: ret=-26.3% mdd=37.8% n=1935 win=55% pf=0.93 avgR=-0.029 fees=$253 (7% of gross) fund=$7.0 exp=26% | IS n=1134 pf=0.94 ret=-15.1% | OOS n=801 pf=0.92 ret=-13.3% | corrL0=+0.44
+      exits {'stop': 758, 'target': 967, 'time': 209, 'end': 1} | per-sym pnl {'ETH': -292.0, 'SOL': -76.5, 'HYPE': 104.8} | solo ret {'ETH': '-27.5%', 'SOL': '-9.5%', 'HYPE': '+12.8%'}
+      periods {'2023Q4-2024Q1': '+12.6%/n230/pf1.29', '2024Q2-Q4': '-13.9%/n445/pf0.85', '2025H1': '-8.2%/n346/pf0.88', '2025H2': '+1.0%/n418/pf1.01', '2026': '-18.0%/n496/pf0.83'}
+[hl4] A: ret=-18.4% mdd=20.0% n=135 win=47% pf=0.63 avgR=-0.196 fees=$33 (10% of gross) fund=$-1.5 exp=16% | IS n=78 pf=0.75 ret=-6.8% | OOS n=57 pf=0.48 ret=-12.4% | corrL0=+0.69
+      exits {'stop': 68, 'target': 64, 'mid_cross': 3} | per-sym pnl {'BTC': -47.8, 'ETH': -35.3, 'SOL': -32.1, 'HYPE': -68.7} | solo ret {'BTC': '-5.2%', 'ETH': '-3.8%', 'SOL': '-3.6%', 'HYPE': '-7.1%'}
+      periods {'2026': '-18.4%/n135/pf0.63'}
+[hl4] B: ret=-8.2% mdd=12.6% n=49 win=29% pf=0.71 avgR=-0.223 fees=$13 (7% of gross) fund=$-0.4 exp=10% | IS n=33 pf=0.86 ret=-1.9% | OOS n=16 pf=0.42 ret=-6.4% | corrL0=+0.29
+      exits {'target': 13, 'stop': 35, 'time': 1} | per-sym pnl {'BTC': 3.1, 'ETH': 9.9, 'SOL': -75.8, 'HYPE': -18.7} | solo ret {'BTC': '+0.2%', 'ETH': '+0.8%', 'SOL': '-7.3%', 'HYPE': '-1.9%'}
+      periods {'2026': '-8.2%/n49/pf0.71'}
+[hl4] C: ret=-15.0% mdd=19.6% n=425 win=54% pf=0.84 avgR=-0.074 fees=$84 (10% of gross) fund=$0.6 exp=30% | IS n=266 pf=0.92 ret=-4.7% | OOS n=159 pf=0.69 ret=-10.8% | corrL0=+0.59
+      exits {'target': 201, 'time': 54, 'stop': 170} | per-sym pnl {'BTC': -48.3, 'ETH': -115.6, 'SOL': -39.9, 'HYPE': 54.0} | solo ret {'BTC': '-4.8%', 'ETH': '-11.4%', 'SOL': '-4.0%', 'HYPE': '+5.2%'}
+      periods {'2026': '-15.0%/n425/pf0.84'}
+[hl3] A: ret=-13.8% mdd=16.3% n=112 win=47% pf=0.67 avgR=-0.173 fees=$26 (9% of gross) fund=$-2.2 exp=14% | IS n=67 pf=0.77 ret=-5.4% | OOS n=45 pf=0.55 ret=-8.9% | corrL0=+0.69
+      exits {'stop': 57, 'target': 54, 'mid_cross': 1} | per-sym pnl {'ETH': -35.7, 'SOL': -33.0, 'HYPE': -69.5} | solo ret {'ETH': '-3.8%', 'SOL': '-3.6%', 'HYPE': '-7.1%'}
+      periods {'2026': '-13.8%/n112/pf0.67'}
+[hl3] B: ret=-8.3% mdd=12.3% n=41 win=27% pf=0.64 avgR=-0.274 fees=$10 (7% of gross) fund=$-0.2 exp=9% | IS n=27 pf=0.72 ret=-3.7% | OOS n=14 pf=0.50 ret=-4.8% | corrL0=+0.31
+      exits {'target': 10, 'stop': 30, 'time': 1} | per-sym pnl {'ETH': 10.1, 'SOL': -74.8, 'HYPE': -18.4} | solo ret {'ETH': '+0.8%', 'SOL': '-7.3%', 'HYPE': '-1.9%'}
+      periods {'2026': '-8.3%/n41/pf0.64'}
+[hl3] C: ret=-10.6% mdd=15.6% n=312 win=54% pf=0.85 avgR=-0.069 fees=$55 (9% of gross) fund=$0.7 exp=24% | IS n=193 pf=0.97 ret=-1.4% | OOS n=119 pf=0.66 ret=-9.3% | corrL0=+0.54
+      exits {'target': 148, 'time': 35, 'stop': 129} | per-sym pnl {'ETH': -118.9, 'SOL': -40.5, 'HYPE': 53.6} | solo ret {'ETH': '-11.4%', 'SOL': '-4.0%', 'HYPE': '+5.2%'}
+      periods {'2026': '-10.6%/n312/pf0.85'}
+
+real	0m5.329s
+user	0m5.216s
+sys	0m0.112s
