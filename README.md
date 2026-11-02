@@ -94,6 +94,15 @@ BTC 日线 ADX 开关（预注册 D-P，先观察再执行）在 `[trend]`：
 
 当前配置是 `shadow`。只在趋势策略的**新开仓**（含 starter，且冷却和风控都已通过、下单之前）看 BTC **已收盘**日线 ADX。低于阈值仍照常下单，并往 `state/btc_regime_shadow.jsonl` 追加一行（`would_block: true/false` 两组都记，方便事后对比）。`enforce` 才真正跳过，并写 `blocked: true`。加仓、金字塔、止损、离场、均值回归不走这条。读 K 线或算 ADX 失败时放行。同一 UTC 日只拉一次 BTC 日线。
 
+另有一道**组合方向**过滤，和上面的 ADX 强度闸独立（ADX 保持 `shadow` 时，这道仍然生效）：
+
+| 键 | 含义 |
+|---|---|
+| `block_new_longs_when_net_short` | `true`（默认，硬拦截）/ `false`（关闭）。空头开仓名义（数量×入场价）大于多头开仓名义时，禁止新标的做多 |
+| `btc_bearish_long_mode` | `off` / `shadow`（只记日志）/ `enforce`（默认，硬拦截新多）。BTC 日线明确空头 = EMA20<EMA50 且 ADX ≥ `regime.clear_trend_adx`（默认 22.5），与环境路由同一套，不看 1h 冲突 |
+
+只挡**新标的**的做多（趋势 starter、Donchian 首仓、均值回归做多）。已有多仓的止损、减仓、Donchian 补仓、金字塔照常。做空不拦。BTC 读数失败放行。被拒时扫描备注写「组合方向拒绝：净空敞口…」或「BTC日线偏空，禁止新开多…」。
+
 ## 实盘权益（对齐 App「可用」）
 
 `--live` 扫描打印的「账户权益」用于单笔风险% 反推仓位，必须接近 App 永续下单页的 **可用**，而不是永续清算所里的 `accountValue`。
