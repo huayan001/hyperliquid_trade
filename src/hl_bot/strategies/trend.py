@@ -7,15 +7,20 @@
 - partial_atr（方案 B，默认）：开仓时冻结 4h ATR(14)；浮盈达 1× 该 ATR 平 50%，2× 平剩余。
   距离从当前均价量。初始结构止损全程冻结，金字塔和 Donchian 加仓都不把止损抬向保本。
 - trail（方案 A）：v0 阶梯移动止损；金字塔加仓后止损抬到保本以上。
+
+强吞没是额外的反向刹车，不替换方案 B。只在 engulf_timeframe 的已收盘 K 上判断。
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 from hl_bot.config import TrendConfig
 from hl_bot.indicators import adx, atr, body_exceeds_atr, donchian, ema, last_value
 from hl_bot.models import (
+    Candle,
     IntentAction,
     MarketSnapshot,
     OrderIntent,
@@ -40,6 +45,66 @@ def _pos_float(value: object) -> float:
     if number != number:  # NaN
         return 0.0
     return number
+
+
+@dataclass(frozen=True, slots=True)
+class EngulfTrigger:
+    """已收盘的强吞没。against 是要平掉并冻结的持仓方向。"""
+
+    against: Side
+    kind: str
+    extreme: float
+    candle_ts: int
+    candle_end_ts: int
+    body: float
+    atr: float
+    close: float
+
+
+def detect_strong_engulfing(candles: Sequence[Candle], cfg: TrendConfig) -> EngulfTrigger | None:
+    """最近两根已收盘 K 是否构成强吞没。
+
+    看涨（针对空头）：前阴后阳，当前实体覆盖前一根实体，收盘高于前高，实体 ≥ min×ATR。
+    开盘允许相对前收有一小段缺口（engulf_gap_tol_frac × 前收）。看跌为镜像。
+    实体不够大、或 K 线尚未收盘（调用方应先丢掉未收盘的那根），都不触发。
+    """
+    if len(candles) < 2:
+        return None
+    prev = candles[-2]
+    current = candles[-1]
+    atr_v = last_value(atr(candles, cfg.atr_period))
+    if atr_v is None or atr_v <= 0:
+        return None
+    if current.body + 1e-12 < cfg.engulf_min_body_atr * atr_v:
+        return None
+    gap = abs(prev.close) * max(0.0, cfg.engulf_gap_tol_frac)
+    if prev.close < prev.open and current.close > current.open:
+        covers = current.open <= prev.close + gap and current.close + 1e-12 >= prev.open
+        if covers and current.close > prev.high:
+            return EngulfTrigger(
+                against=Side.SHORT,
+                kind="bullish",
+                extreme=current.low,
+                candle_ts=current.ts,
+                candle_end_ts=current.end_ts,
+                body=current.body,
+                atr=atr_v,
+                close=current.close,
+            )
+    if prev.close > prev.open and current.close < current.open:
+        covers = current.open + gap >= prev.close and current.close <= prev.open + 1e-12
+        if covers and current.close < prev.low:
+            return EngulfTrigger(
+                against=Side.LONG,
+                kind="bearish",
+                extreme=current.high,
+                candle_ts=current.ts,
+                candle_end_ts=current.end_ts,
+                body=current.body,
+                atr=atr_v,
+                close=current.close,
+            )
+    return None
 
 
 def record_entry_exit_reference(position: Position) -> None:
@@ -256,6 +321,31 @@ class TrendStrategy(Strategy):
         if side is Side.LONG:
             return last.close > upper
         return last.close < lower
+
+    def donchian_break_after(
+        self,
+        market: MarketSnapshot,
+        side: Side,
+        after_end_ts: int,
+        now_ms: int | None = None,
+    ) -> bool:
+        """最近一根已收盘 4h 本身突破 Donchian，且这根 K 的结束时间晚于 after_end_ts。
+
+        冻结之前就已经突破、只是通道还留在外侧的旧 K，不算新突破。
+        """
+        h4 = last_closed(market.h4, now_ms)
+        need = max(self.cfg.donchian_period + 2, self.cfg.atr_period + 2)
+        if len(h4) < need:
+            return False
+        last = h4[-1]
+        if last.end_ts <= after_end_ts:
+            return False
+        uppers, lowers = donchian(h4, self.cfg.donchian_period, exclude_current=True)
+        upper = uppers[-1]
+        lower = lowers[-1]
+        if upper is None or lower is None:
+            return False
+        return self._donchian_confirmed(side, last, float(upper), float(lower))
 
     def post_stop_reclaim_block(
         self,

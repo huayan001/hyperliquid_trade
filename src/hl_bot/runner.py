@@ -62,8 +62,9 @@ from hl_bot.risk import (
     clamp_stop_for_leverage,
     format_ratio_pct,
 )
+from hl_bot.strategies.base import last_closed, make_close_intent
 from hl_bot.strategies.mean_reversion import MeanReversionStrategy
-from hl_bot.strategies.trend import TrendStrategy
+from hl_bot.strategies.trend import TrendStrategy, detect_strong_engulfing
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,12 @@ class BotRunner:
                     f"（当前年化 {market.funding.annualized:.1%}，24h均 {market.funding.annualized_24h:.1%}）"
                 )
 
+            engulf_exits = self._refresh_engulfing(market, now_ms)
             exits = self._exits_for(market, decision, now_ms)
+            # 强吞没要一次平掉剩余仓。同一轮不再另发方案 B 的减仓，避免两张平仓单叠在一起。
+            # 没触发时仍走原来的 exit_mode。
+            if engulf_exits:
+                exits = engulf_exits
             for item in exits:
                 self._execute(item, now_ms, persist_paper=persist_paper)
 
@@ -239,7 +245,11 @@ class BotRunner:
             if closing:
                 notes.append("本轮已有离场意图，不再开新仓或金字塔加仓")
             elif existing is not None:
-                if existing.strategy is StrategyName.TREND:
+                frozen = self._entry_freeze_reason(symbol, existing.side)
+                if frozen:
+                    notes.append(f"吞没冻结：{frozen}")
+                    logger.info("%s %s", symbol, frozen)
+                elif existing.strategy is StrategyName.TREND:
                     if existing.starter_pending():
                         signal = self.trend.generate_breakout_add(existing, market, decision, now_ms)
                         if signal is not None:
@@ -288,7 +298,13 @@ class BotRunner:
             cooldown = None
             reclaim_block = None
             direction_block = None
+            freeze_block = None
             if signal is not None and existing is None and not closing:
+                freeze_block = self._entry_freeze_reason(symbol, signal.side)
+                if freeze_block:
+                    notes.append(f"吞没冻结：{freeze_block}")
+                    logger.info("%s 新开仓被吞没冻结拒绝：%s", symbol, freeze_block)
+            if signal is not None and existing is None and not closing and not freeze_block:
                 cooldown = self.stop_cooldown_reason(symbol, signal.side, now_ms)
                 if cooldown:
                     notes.append(f"止损冷却拒绝：{cooldown}")
@@ -315,6 +331,7 @@ class BotRunner:
                 and not cooldown
                 and not reclaim_block
                 and not direction_block
+                and not freeze_block
             ):
                 against = funding_against(signal.side, market.funding.hourly_rate)
                 huge_funding = (
@@ -524,6 +541,7 @@ class BotRunner:
         self._exchange_positions = positions
         self._live_book_ok = True
         self._cancel_stacked_entries()
+        self._cancel_older_cross_band_rests()
         self._freeze_partial_atr_stops()
         self._drop_filled_resting(positions)
         self._align_open_sizes(positions)
@@ -579,6 +597,7 @@ class BotRunner:
     def _drop_filled_resting(self, positions: dict[str, ExchangePosition]) -> None:
         open_oids = {oid for oid in (order_oid(row) for row in self._open_orders or []) if oid is not None}
         kept: list[RestingEntry] = []
+        adopted: list[RestingEntry] = []
         for rec in self.account.resting_entries:
             if rec.oid is not None and rec.oid in open_oids:
                 kept.append(rec)
@@ -589,7 +608,10 @@ class BotRunner:
             ex = self._exchange_position(positions, rec.symbol)
             if ex is not None and ex.side.value == rec.side:
                 self._adopt_resting_fill(rec, ex)
+                adopted.append(rec)
         self.account.resting_entries = kept
+        for rec in adopted:
+            self._cancel_other_bands_after_fill(rec)
 
     def _book_has_resting(self, rec: RestingEntry) -> bool:
         is_buy = rec.side == Side.LONG.value
@@ -1201,19 +1223,303 @@ class BotRunner:
         elif outcome.get("action") not in {"kept", "placed", "skipped"}:
             logger.warning("%s 保护止损对账异常结果: %s", symbol, outcome)
 
+    def _engulf_candles(self, market: MarketSnapshot, now_ms: int) -> list:
+        series = market.h4 if self.cfg.trend.engulf_timeframe == "4h" else market.h1
+        return last_closed(series, now_ms)
+
+    def _freeze_row(self, symbol: str, side: Side) -> dict | None:
+        book = self.account.entry_freezes.get(symbol.upper())
+        if not isinstance(book, dict):
+            for key, value in self.account.entry_freezes.items():
+                if str(key).upper() == symbol.upper() and isinstance(value, dict):
+                    book = value
+                    break
+            else:
+                return None
+        row = book.get(side.value)
+        return row if isinstance(row, dict) else None
+
+    def _write_freeze(self, symbol: str, side: Side, row: dict) -> None:
+        book = self.account.entry_freezes.setdefault(symbol.upper(), {})
+        book[side.value] = row
+
+    def _entry_freeze_reason(self, symbol: str, side: Side) -> str | None:
+        if not self.cfg.trend.engulf_reversal_enabled:
+            return None
+        row = self._freeze_row(symbol, side)
+        if not row or not row.get("active"):
+            return None
+        extreme = float(row.get("extreme") or 0.0)
+        direction = "做空" if side is Side.SHORT else "做多"
+        tf = self.cfg.trend.engulf_timeframe
+        return (
+            f"{symbol} {direction}被 {tf} 强吞没冻结"
+            f"（极值 {extreme:.6g}），直到该周期收盘突破极值或出现新的同向 Donchian 突破"
+        )
+
+    def _refresh_engulfing(self, market: MarketSnapshot, now_ms: int) -> list[OrderIntent]:
+        """已收盘强吞没：平掉剩余反向仓、撤同向入场挂单，并冻结该方向的新开仓。"""
+        if not self.cfg.trend.engulf_reversal_enabled:
+            return []
+        changed = self._lift_engulf_freezes(market, now_ms)
+        intents, armed = self._arm_engulf(market, now_ms)
+        if changed or armed:
+            self.broker.save()
+        return intents
+
+    def _lift_engulf_freezes(self, market: MarketSnapshot, now_ms: int) -> bool:
+        changed = False
+        closed = self._engulf_candles(market, now_ms)
+        last = closed[-1] if closed else None
+        for side in (Side.SHORT, Side.LONG):
+            row = self._freeze_row(market.symbol, side)
+            if not row or not row.get("active"):
+                continue
+            trigger_end = int(row.get("candle_end_ts") or 0)
+            extreme = float(row.get("extreme") or 0.0)
+            if last is not None and last.end_ts > trigger_end and extreme > 0:
+                broke = last.close < extreme if side is Side.SHORT else last.close > extreme
+                if broke:
+                    self._deactivate_freeze(market.symbol, side, row)
+                    logger.info(
+                        "%s 解除%s冻结：%s 收盘 %.6g 突破吞没极值 %.6g",
+                        market.symbol,
+                        "做空" if side is Side.SHORT else "做多",
+                        self.cfg.trend.engulf_timeframe,
+                        last.close,
+                        extreme,
+                    )
+                    changed = True
+                    continue
+            if self.trend.donchian_break_after(market, side, trigger_end, now_ms):
+                self._deactivate_freeze(market.symbol, side, row)
+                logger.info(
+                    "%s 解除%s冻结：冻结之后出现新的 4h Donchian %s向突破",
+                    market.symbol,
+                    "做空" if side is Side.SHORT else "做多",
+                    "下" if side is Side.SHORT else "上",
+                )
+                changed = True
+        return changed
+
+    def _deactivate_freeze(self, symbol: str, side: Side, row: dict) -> None:
+        kept = dict(row)
+        kept["active"] = False
+        self._write_freeze(symbol, side, kept)
+
+    def _arm_engulf(self, market: MarketSnapshot, now_ms: int) -> tuple[list[OrderIntent], bool]:
+        trigger = detect_strong_engulfing(self._engulf_candles(market, now_ms), self.cfg.trend)
+        if trigger is None:
+            return [], False
+        row = self._freeze_row(market.symbol, trigger.against)
+        same_candle = row is not None and int(row.get("candle_end_ts") or 0) == int(trigger.candle_end_ts)
+        if same_candle and not row.get("active"):
+            return [], False
+        changed = False
+        if not same_candle or not row.get("active"):
+            self._write_freeze(
+                market.symbol,
+                trigger.against,
+                {
+                    "active": True,
+                    "extreme": trigger.extreme,
+                    "candle_ts": trigger.candle_ts,
+                    "candle_end_ts": trigger.candle_end_ts,
+                    "kind": trigger.kind,
+                    "body": trigger.body,
+                    "atr": trigger.atr,
+                },
+            )
+            direction = "新空" if trigger.against is Side.SHORT else "新多"
+            kind = "看涨、针对空头" if trigger.kind == "bullish" else "看跌、针对多头"
+            logger.info(
+                "%s %s强吞没（%s）收盘确认：实体 %.6g ≥ %.3g×ATR %.6g，冻结%s，极值 %.6g（K线结束 %s）",
+                market.symbol,
+                self.cfg.trend.engulf_timeframe,
+                kind,
+                trigger.body,
+                self.cfg.trend.engulf_min_body_atr,
+                trigger.atr,
+                direction,
+                trigger.extreme,
+                trigger.candle_end_ts,
+            )
+            changed = True
+        return self._engulf_actions(market, trigger), changed
+
+    def _engulf_actions(self, market: MarketSnapshot, trigger) -> list[OrderIntent]:
+        tf = self.cfg.trend.engulf_timeframe
+        self._cancel_entry_orders(
+            market.symbol,
+            trigger.against,
+            reason=f"{tf} 强吞没冻结{trigger.against.value}，撤掉该方向入场挂单",
+            keep_band=None,
+            include_unrecorded=True,
+        )
+        pos = self.account.position_for(market.symbol)
+        if pos is None or pos.side is not trigger.against or pos.size <= 0:
+            return []
+        price = market.mid or trigger.close
+        kind = "看涨" if trigger.kind == "bullish" else "看跌"
+        held = "空" if pos.side is Side.SHORT else "多"
+        return [
+            make_close_intent(
+                pos,
+                price,
+                (
+                    f"{tf} {kind}强吞没收盘确认，平掉剩余{held}仓"
+                    f"（实体 {trigger.body:.6g} ≥ {self.cfg.trend.engulf_min_body_atr:g}×ATR {trigger.atr:.6g}，"
+                    f"极值 {trigger.extreme:.6g}）"
+                ),
+                extras={
+                    "engulf_reversal": True,
+                    "engulf_kind": trigger.kind,
+                    "engulf_extreme": trigger.extreme,
+                    "engulf_candle_end_ts": trigger.candle_end_ts,
+                },
+            )
+        ]
+
+    def _cancel_older_cross_band_rests(self) -> None:
+        """同一币同一方向有两档入场挂单时，留下 oid 较新的那档，撤掉较早的一档。"""
+        groups: dict[tuple[str, str], list[tuple[int, RestingEntry]]] = {}
+        for index, rec in enumerate(self.account.resting_entries):
+            groups.setdefault((rec.symbol.upper(), rec.side), []).append((index, rec))
+        for (symbol, side_value), rows in groups.items():
+            bands = {_entry_band(rec.tier, rec.tag, rec.extras) for _, rec in rows}
+            if len(bands) < 2:
+                continue
+            try:
+                side = Side(side_value)
+            except ValueError:
+                continue
+            newest = max(rows, key=lambda item: (item[1].oid if item[1].oid is not None else -1, item[0]))
+            keep_band = _entry_band(newest[1].tier, newest[1].tag, newest[1].extras)
+            self._cancel_entry_orders(
+                symbol,
+                side,
+                reason=f"同向已有更新的 {keep_band} 挂单，撤掉较早的其他入场档",
+                keep_band=keep_band,
+                include_unrecorded=False,
+            )
+
+    def _cancel_conflicting_entry_rests(self, intent: OrderIntent) -> None:
+        if intent.action not in (IntentAction.OPEN, IntentAction.ADD) or intent.reduce_only:
+            return
+        band = _entry_band(_intent_tier(intent), str(intent.extras.get("tag") or ""), intent.extras)
+        self._cancel_entry_orders(
+            intent.symbol,
+            intent.side,
+            reason=f"已提交 {band}，撤掉同向其他入场档，避免两档同时在场",
+            keep_band=band,
+            include_unrecorded=False,
+        )
+
+    def _cancel_other_bands_after_fill(self, rec: RestingEntry) -> None:
+        try:
+            side = Side(rec.side)
+        except ValueError:
+            return
+        band = _entry_band(rec.tier, rec.tag, rec.extras)
+        self._cancel_entry_orders(
+            rec.symbol,
+            side,
+            reason=f"{band} 已成交，撤掉同向其他入场档",
+            keep_band=band,
+            include_unrecorded=False,
+        )
+
+    def _cancel_entry_orders(
+        self,
+        symbol: str,
+        side: Side,
+        *,
+        reason: str,
+        keep_band: str | None,
+        include_unrecorded: bool,
+    ) -> None:
+        """撤掉同币同向的入场/加仓挂单。保护止损是 reduce-only，不在此列。"""
+        victims: list[RestingEntry] = []
+        for rec in self.account.resting_entries:
+            if rec.symbol.upper() != symbol.upper() or rec.side != side.value:
+                continue
+            if keep_band is not None and _entry_band(rec.tier, rec.tag, rec.extras) == keep_band:
+                continue
+            victims.append(rec)
+        oids: list[int] = []
+        for rec in victims:
+            if rec.oid is not None:
+                oids.append(int(rec.oid))
+        if include_unrecorded:
+            for order in self._open_orders or []:
+                if not isinstance(order, dict) or not is_open_entry_order(order, symbol):
+                    continue
+                if not _order_matches_entry_side(order, side):
+                    continue
+                oid = order_oid(order)
+                if oid is not None:
+                    oids.append(int(oid))
+        seen: list[int] = []
+        for oid in oids:
+            if oid not in seen:
+                seen.append(oid)
+        if not seen and not victims:
+            return
+        cancelled: set[int] = set()
+        if seen and not self.cfg.dry_run:
+            cancelled.update(self.client._cancel_oids(symbol, seen))
+        elif self.cfg.dry_run:
+            cancelled.update(seen)
+        victim_ids = {id(rec) for rec in victims}
+        kept: list[RestingEntry] = []
+        dropped: list[RestingEntry] = []
+        for rec in self.account.resting_entries:
+            if id(rec) not in victim_ids:
+                kept.append(rec)
+                continue
+            if rec.oid is None or rec.oid in cancelled:
+                dropped.append(rec)
+                continue
+            kept.append(rec)
+        self.account.resting_entries = kept
+        if cancelled and self._open_orders is not None:
+            self._open_orders = [row for row in self._open_orders if order_oid(row) not in cancelled]
+        recorded = {rec.oid for rec in dropped}
+        for rec in dropped:
+            logger.info(
+                "%s 撤销冲突挂单 direction=%s tier=%s oid=%s px=%s size=%s：%s",
+                rec.symbol,
+                rec.side,
+                rec.tier,
+                rec.oid,
+                rec.price,
+                rec.size,
+                reason,
+            )
+        for oid in sorted(cancelled):
+            if oid not in recorded:
+                logger.info("%s 撤销冲突挂单 direction=%s oid=%s：%s", symbol, side.value, oid, reason)
+
     def _resting_block_reason(self, intent: OrderIntent) -> str | None:
-        """同标的同档，或交易所已有同向同价的非 reduce-only 挂单，则不再叠一张。"""
+        """同一入场档，或交易所已有同向同价的非 reduce-only 挂单，则不再叠一张。
+
+        不同档（starter 与 Donchian）不在这里跳过。下单成功后会撤掉同向的另一档。
+        """
         if intent.action not in (IntentAction.OPEN, IntentAction.ADD) or intent.reduce_only:
             return None
         tier = _intent_tier(intent)
+        band = _entry_band(tier, str(intent.extras.get("tag") or ""), intent.extras)
         book = self._open_orders
         orders = list(book or [])
         for rec in self.account.resting_entries:
             if rec.symbol.upper() != intent.symbol.upper():
                 continue
+            rec_band = _entry_band(rec.tier, rec.tag, rec.extras)
+            same_band_side = rec_band == band and rec.side == intent.side.value
             if book is None:
-                # 还没读到本轮挂单：本地记录在，就先不要再叠一张
-                if rec.tier == tier or (
+                # 还没读到本轮挂单：同一档的本地记录在，就先不要再叠一张。
+                # 不同档留给下单成功后的撤单，避免 starter 和 Donchian 一起挂着。
+                if rec.tier == tier or same_band_side or (
                     rec.side == intent.side.value and prices_close(rec.price, float(intent.price))
                 ):
                     return f"本地仍记录 resting tier={rec.tier} oid={rec.oid}"
@@ -1223,6 +1529,8 @@ class BotRunner:
                 continue
             if rec.tier == tier:
                 return f"同档 {tier} oid={rec.oid}"
+            if same_band_side:
+                return f"同档 {rec.tier} oid={rec.oid}（已有 {band} 挂单）"
             if rec.side == intent.side.value and prices_close(rec.price, float(intent.price)):
                 return f"同价 {intent.price} oid={rec.oid}"
         is_buy = intent.side is Side.LONG
@@ -1318,6 +1626,13 @@ class BotRunner:
         decimals = int(meta.get("sz_decimals") or 4)
         result = self.client.place(intent, sz_decimals=decimals)
         logger.info("实盘下单返回: %s", result)
+        if (
+            intent.action in (IntentAction.OPEN, IntentAction.ADD)
+            and not intent.reduce_only
+            and _entry_accepted(result)
+        ):
+            # 新档已经挂上或成交，再撤同向其他档。下单失败则留着原来的挂单。
+            self._cancel_conflicting_entry_rests(intent)
         self._sync_live_fill(intent, result, now_ms)
 
     def _maybe_record_bot_stop(
@@ -1453,6 +1768,57 @@ def _stop_side_fill(pos: Position, px: float) -> bool:
 
 def _intent_tier(intent: OrderIntent) -> str:
     return str(intent.extras.get("tier") or intent.extras.get("tag") or intent.action.value)
+
+
+def _entry_band(tier: str, tag: str = "", extras: dict | None = None) -> str:
+    """入场档。同一币、同一方向同时只留一档。
+
+    starter（试探/probe）与 breakout（Donchian、chase、突破补仓）互相排斥。
+    同档已有挂单时跳过新单；不同档则在新单提交成功后撤掉较早的那档。
+    """
+    extras = extras or {}
+    text = " ".join(
+        str(part or "")
+        for part in (tier, tag, extras.get("tier"), extras.get("tag"))
+    ).lower()
+    if extras.get("starter") or "starter" in text or "probe" in text:
+        return "starter"
+    if extras.get("pyramid") or "pyramid" in text:
+        return "pyramid"
+    if (
+        extras.get("tier_add")
+        or extras.get("breakout_add")
+        or extras.get("chase")
+        or "donchian" in text
+        or "breakout" in text
+        or "chase" in text
+    ):
+        return "breakout"
+    stripped = text.strip()
+    return stripped or "open"
+
+
+def _entry_accepted(result: object) -> bool:
+    """新入场已经成交，或确认留在盘口。失败、以及市价只 resting 随即被撤的，不算。"""
+    if not isinstance(result, dict):
+        return False
+    status = str(result.get("status") or "").lower()
+    if status in {"error", "err", "dry_run"}:
+        return False
+    fill = extract_order_fill(result)
+    if fill is not None and fill.size > 0:
+        return True
+    kept = _kept_resting_oids(result)
+    if result.get("entry_unfilled") and not kept:
+        return False
+    return bool(kept)
+
+
+def _order_matches_entry_side(order: dict, side: Side) -> bool:
+    buy = order_is_buy(order)
+    if buy is None:
+        return False
+    return buy if side is Side.LONG else not buy
 
 
 def _kept_resting_oids(result: object) -> list[int]:

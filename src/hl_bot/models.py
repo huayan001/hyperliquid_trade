@@ -308,6 +308,10 @@ class AccountState:
     equity_abstraction: str = ""
     # 每个标的最近一次止损出场：{"ts": ms, "side": "long"/"short", "price": float, "pnl": float}
     last_stops: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 强吞没冻结。键是币种，内层键是被冻结的持仓方向 long/short。
+    # {"active": bool, "extreme": float, "candle_end_ts": int, "kind": "bullish"|"bearish", ...}
+    # active 关掉后仍留着 candle_end_ts，避免同一根已处理的 K 线再次触发。
+    entry_freezes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def open_positions(self) -> list[Position]:
         return [p for p in self.positions if p.size > 0]

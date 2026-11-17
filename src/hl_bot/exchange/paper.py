@@ -125,6 +125,7 @@ class PaperBroker:
             "last_good_day_key": self.account.last_good_day_key,
             "equity_abstraction": self.account.equity_abstraction,
             "last_stops": self.account.last_stops,
+            "entry_freezes": self.account.entry_freezes,
             "positions": [
                 {
                     "symbol": p.symbol,
@@ -180,6 +181,7 @@ class PaperBroker:
             last_stops={
                 str(k): dict(v) for k, v in (raw.get("last_stops") or {}).items() if isinstance(v, dict)
             },
+            entry_freezes=_load_entry_freezes(raw.get("entry_freezes")),
         )
         if account.day_key != day_key:
             account.day_start_equity = account.equity
@@ -209,6 +211,19 @@ class PaperBroker:
             if isinstance(item, dict):
                 account.resting_entries.append(_resting_from_dict(item))
         return cls(account, path)
+
+
+def _load_entry_freezes(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for symbol, book in raw.items():
+        if not isinstance(book, dict):
+            continue
+        sides = {str(side): dict(row) for side, row in book.items() if isinstance(row, dict)}
+        if sides:
+            out[str(symbol)] = sides
+    return out
 
 
 def _resting_to_dict(item: RestingEntry) -> dict:
