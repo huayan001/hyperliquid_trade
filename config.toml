@@ -86,6 +86,16 @@ block_new_longs_when_net_short = true
 # 明确空头与环境路由一致：EMA20<EMA50 且日线 ADX≥regime.clear_trend_adx（默认 22.5），
 # 不看 1h 是否冲突。与上面的 btc_regime_mode（ADX 强度、仍是 shadow、多空都看）独立。读数失败放行。
 btc_bearish_long_mode = "enforce"
+# 1h 强吞没反向刹车（默认开）。不替换方案 B：1×ATR 仍平 50%，2×ATR 仍平剩余。
+# 只在该周期 K 线收盘后判断。看涨吞没：前一根阴线、当前阳线、实体覆盖前一根实体
+# （开盘允许相对前收偏离 engulf_gap_tol_frac）、收盘高于前高，且实体 ≥ engulf_min_body_atr × 该周期 ATR。
+# 触发后市价平掉剩余空仓、撤掉该币同向入场挂单（不动保护止损），并冻结新空，
+# 直到之后一根该周期收盘跌破吞没 K 的最低价，或出现冻结之后新的 4h Donchian 向下突破。
+# 看跌吞没对称处理多仓。空头冻结不拦多头，多头冻结不拦空头。
+engulf_reversal_enabled = true
+engulf_timeframe = "1h"
+engulf_min_body_atr = 1.0
+engulf_gap_tol_frac = 0.001
 
 [mean_reversion]
 bb_period = 20

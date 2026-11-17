@@ -117,6 +117,13 @@ class TrendConfig:
     # BTC 日线明确空头时禁止新开多。off 关闭；shadow 只记日志；enforce 硬拦截。
     # 与 btc_regime_mode（ADX 强度，多空新趋势仓都看）独立。阈值用 regime.clear_trend_adx。
     btc_bearish_long_mode: str = "enforce"
+    # 强吞没反向刹车，叠在方案 B 之上，不替换 1×/2× 分批。只看该周期已收盘 K。
+    # 看涨吞没平掉剩余空仓并冻结新空；看跌吞没对称处理多仓。对向不受影响。
+    engulf_reversal_enabled: bool = True
+    engulf_timeframe: str = "1h"
+    engulf_min_body_atr: float = 1.0
+    # 当前 K 开盘相对前收允许的偏离，占前收的比例。连续成交会在前收上方/下方一点点开盘。
+    engulf_gap_tol_frac: float = 0.001
 
 
 @dataclass(slots=True)
@@ -243,6 +250,22 @@ def _parse_btc_regime_period(value: Any) -> int:
     return number
 
 
+def _parse_engulf_timeframe(value: Any) -> str:
+    if value is None or value == "":
+        return "1h"
+    token = str(value).strip().lower()
+    if token not in {"1h", "4h"}:
+        raise ValueError(f"trend.engulf_timeframe 必须是 1h 或 4h，收到 {value!r}")
+    return token
+
+
+def _parse_engulf_gap(value: Any) -> float:
+    number = _as_float(value, 0.001)
+    if math.isnan(number) or math.isinf(number) or number < 0 or number > 0.02:
+        raise ValueError(f"trend.engulf_gap_tol_frac 必须在 [0, 0.02] 内，收到 {value!r}")
+    return number
+
+
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name, {})
     return value if isinstance(value, dict) else {}
@@ -349,6 +372,12 @@ def load_config(
                 name="trend.btc_bearish_long_mode",
                 default="enforce",
             ),
+            engulf_reversal_enabled=_as_bool(trend_raw.get("engulf_reversal_enabled"), True),
+            engulf_timeframe=_parse_engulf_timeframe(trend_raw.get("engulf_timeframe")),
+            engulf_min_body_atr=_parse_positive_float(
+                trend_raw.get("engulf_min_body_atr"), 1.0, "trend.engulf_min_body_atr"
+            ),
+            engulf_gap_tol_frac=_parse_engulf_gap(trend_raw.get("engulf_gap_tol_frac")),
         ),
         mean_reversion=MeanReversionConfig(
             bb_period=_as_int(mr_raw.get("bb_period"), 20),
